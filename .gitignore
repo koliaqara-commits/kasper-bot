@@ -1,0 +1,5 @@
+.env
+kasper.sqlite3
+kasper.log
+__pycache__/
+*.pyc
