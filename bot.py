@@ -126,6 +126,18 @@ def init_db() -> None:
                 added_by INTEGER,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS balance_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                currency TEXT NOT NULL,
+                amount REAL NOT NULL,
+                operation TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                deal_tag TEXT,
+                actor_id INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(users)").fetchall()}
@@ -255,7 +267,34 @@ def set_setting(key: str, value: str) -> None:
         connection.commit()
 
 
-def add_balance(user_id: int, amount: float, currency: str) -> None:
+def record_balance_history(
+    user_id: int,
+    amount: float,
+    currency: str,
+    operation: str,
+    reason: str,
+    deal_tag: str | None = None,
+    actor_id: int | None = None,
+) -> None:
+    with closing(db()) as connection:
+        connection.execute(
+            """
+            INSERT INTO balance_history(user_id, currency, amount, operation, reason, deal_tag, actor_id)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, currency, amount, operation, reason, deal_tag, actor_id),
+        )
+        connection.commit()
+
+
+def add_balance(
+    user_id: int,
+    amount: float,
+    currency: str,
+    reason: str = "manual_topup",
+    deal_tag: str | None = None,
+    actor_id: int | None = None,
+) -> None:
     with closing(db()) as connection:
         connection.execute(
             """
@@ -266,6 +305,17 @@ def add_balance(user_id: int, amount: float, currency: str) -> None:
             (user_id, currency, amount),
         )
         connection.commit()
+    record_balance_history(user_id, amount, currency, "credit", reason, deal_tag, actor_id)
+
+
+def debit_balance(user_id: int, amount: float, currency: str, reason: str, deal_tag: str | None = None) -> None:
+    with closing(db()) as connection:
+        connection.execute(
+            "UPDATE balances SET amount = amount - ? WHERE user_id = ? AND currency = ?",
+            (amount, user_id, currency),
+        )
+        connection.commit()
+    record_balance_history(user_id, -amount, currency, "debit", reason, deal_tag)
 
 
 def get_balance(user_id: int, currency: str) -> float:
@@ -288,6 +338,34 @@ def get_balances(user_id: int) -> list[sqlite3.Row]:
 def balance_lines(user_id: int) -> str:
     rows = {row["currency"]: float(row["amount"]) for row in get_balances(user_id)}
     return "\n".join(f"• {currency}: {money(rows.get(currency, 0.0))}" for currency in CURRENCIES)
+
+
+def balance_history_lines(user_id: int, limit: int = 8) -> str:
+    with closing(db()) as connection:
+        rows = connection.execute(
+            """
+            SELECT amount, currency, operation, reason, deal_tag, created_at
+            FROM balance_history
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        ).fetchall()
+    if not rows:
+        return "История пока пустая."
+    labels = {
+        "manual_topup": "Пополнение",
+        "deal_payment": "Оплата сделки",
+        "deal_release": "Получено по сделке",
+    }
+    lines = []
+    for row in rows:
+        sign = "+" if float(row["amount"]) > 0 else ""
+        deal = f" #{row['deal_tag']}" if row["deal_tag"] else ""
+        reason = labels.get(row["reason"], row["reason"])
+        lines.append(f"{sign}{money(float(row['amount']))} {row['currency']} — {reason}{deal}")
+    return "\n".join(lines)
 
 
 def pay_deal_from_balance(tag: str, user_id: int, lang: str = "ru") -> tuple[bool, str]:
@@ -319,6 +397,7 @@ def pay_deal_from_balance(tag: str, user_id: int, lang: str = "ru") -> tuple[boo
         )
         connection.execute("UPDATE deals SET status = 'paid' WHERE tag = ?", (tag,))
         connection.commit()
+        record_balance_history(user_id, -amount, row["currency"], "debit", "deal_payment", tag)
 
     return True, f"✅ Deal #{tag} paid from balance." if lang == "en" else f"✅ Сделка #{tag} оплачена с баланса."
 
@@ -331,7 +410,7 @@ def release_deal_to_seller(tag: str) -> tuple[bool, str, Deal | None]:
         return False, "Сделка уже завершена.", deal
     if deal.status != "paid":
         return False, "Сделка еще не оплачена.", deal
-    add_balance(deal.seller_id, deal.amount, deal.currency)
+    add_balance(deal.seller_id, deal.amount, deal.currency, reason="deal_release", deal_tag=deal.tag)
     increment_success_orders(deal.seller_id, deal.amount)
     with closing(db()) as connection:
         connection.execute("UPDATE deals SET status = 'completed' WHERE tag = ?", (tag,))
@@ -454,6 +533,80 @@ def money(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else f"{value:.2f}"
 
 
+def seller_level(orders: int, volume: float, lang: str = "ru") -> str:
+    if orders >= 100 or volume >= 100000:
+        return "🏆 Legend Seller" if lang == "en" else "🏆 Легенда Kasper"
+    if orders >= 30 or volume >= 30000:
+        return "🔥 Top Seller" if lang == "en" else "🔥 Топ продавец"
+    if orders >= 10 or volume >= 10000:
+        return "✅ Trusted Seller" if lang == "en" else "✅ Надёжный продавец"
+    return "🌱 New Seller" if lang == "en" else "🌱 Начинающий продавец"
+
+
+def public_name(row: sqlite3.Row) -> str:
+    username = row["username"] if "username" in row.keys() else ""
+    first_name = row["first_name"] if "first_name" in row.keys() else ""
+    if username:
+        return f"@{username}"
+    if first_name:
+        return first_name
+    return f"ID {row['id']}"
+
+
+def top_users(order_by: str = "orders", limit: int = 10) -> list[sqlite3.Row]:
+    column = "success_volume" if order_by == "volume" else "success_orders"
+    with closing(db()) as connection:
+        return connection.execute(
+            f"""
+            SELECT id, username, first_name, rating, success_orders, success_volume
+            FROM users
+            WHERE success_orders > 0 OR success_volume > 0
+            ORDER BY {column} DESC, success_orders DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+
+def staff_ids() -> list[int]:
+    ids = set(ADMIN_IDS) | set(WORKER_IDS)
+    with closing(db()) as connection:
+        rows = connection.execute("SELECT user_id FROM admins").fetchall()
+    ids.update(int(row["user_id"]) for row in rows)
+    return sorted(ids)
+
+
+def staff_profiles() -> list[sqlite3.Row]:
+    ids = staff_ids()
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    with closing(db()) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT id, username, first_name, rating, success_orders, success_volume
+            FROM users
+            WHERE id IN ({placeholders})
+            ORDER BY success_orders DESC, success_volume DESC
+            """,
+            ids,
+        ).fetchall()
+    known = {int(row["id"]) for row in rows}
+    missing = [
+        {
+            "id": user_id,
+            "username": "",
+            "first_name": "",
+            "rating": 0,
+            "success_orders": 0,
+            "success_volume": 0,
+        }
+        for user_id in ids
+        if user_id not in known
+    ]
+    return rows + missing
+
+
 def button(text: str, *, callback_data: str | None = None, url: str | None = None, style: str = "primary") -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=callback_data, url=url, style=style)
 
@@ -463,14 +616,14 @@ def main_menu(lang: str = "ru") -> InlineKeyboardMarkup:
         rows = [
             [button("🆕 Create order", callback_data="deal:create", style="success")],
             [button("💳 Balance", callback_data="topup"), button("🔔 Security", callback_data="requisites")],
-            [button("💙 Referrals", callback_data="refs"), button("👤 Profile", callback_data="profile")],
+            [button("📊 Top", callback_data="top"), button("👤 Profile", callback_data="profile")],
             [button("💬 Support", url=f"https://t.me/{SUPPORT_USERNAME}"), button("🔵 Language", callback_data="language")],
         ]
     else:
         rows = [
             [button("🆕 Создать ордер", callback_data="deal:create", style="success")],
             [button("💳 Баланс", callback_data="topup"), button("🔔 Безопасность", callback_data="requisites")],
-            [button("💙 Рефералы", callback_data="refs"), button("👤 Профиль", callback_data="profile")],
+            [button("📊 Топ", callback_data="top"), button("👤 Профиль", callback_data="profile")],
             [button("💬 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}"), button("🔵 Язык", callback_data="language")],
         ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -527,12 +680,14 @@ def balance_actions_keyboard(lang: str) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             inline_keyboard=[
                 [button("💎 Withdraw balance", callback_data="balance:withdraw"), button("💎 Top up balance", callback_data="balance:topup", style="success")],
+                [button("📜 Balance history", callback_data="balance:history")],
                 [button("◀️ Menu", callback_data="menu")],
             ]
         )
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [button("💎 Вывести баланс", callback_data="balance:withdraw"), button("💎 Пополнить баланс", callback_data="balance:topup", style="success")],
+            [button("📜 История баланса", callback_data="balance:history")],
             [button("◀️ В меню", callback_data="menu")],
         ]
     )
@@ -966,20 +1121,23 @@ async def profile(callback: CallbackQuery) -> None:
     rating = float(stats["rating"]) if stats else 0.0
     orders = int(stats["success_orders"]) if stats else 0
     volume = float(stats["success_volume"]) if stats and "success_volume" in stats.keys() else 0.0
+    level = seller_level(orders, volume, lang)
     if lang == "en":
         text = (
-            "🚘 <b>Profile</b>\n\n"
+            "👤 <b>Profile</b>\n\n"
             f"🎩 Username: @{user.username or 'none'}\n\n"
             f"📦 ID: <code>{user.id}</code>\n\n"
+            f"🏅 Level: {level}\n\n"
             f"⚭ Rating: {rating:.1f}\n\n"
             f"🔗 Successful orders: {orders}\n\n"
             f"💎 Successful deals volume: {money(volume)} Stars"
         )
     else:
         text = (
-            "🚘 <b>Профиль</b>\n\n"
+            "👤 <b>Профиль</b>\n\n"
             f"🎩 Username: @{user.username or 'нет'}\n\n"
             f"📦 ID: <code>{user.id}</code>\n\n"
+            f"🏅 Уровень: {level}\n\n"
             f"⚭ Рейтинг: {rating:.1f}\n\n"
             f"🔗 Успешных ордеров: {orders}\n\n"
             f"💎 Сумма успешных сделок: {money(volume)} Stars"
@@ -1007,6 +1165,17 @@ async def balance_action(callback: CallbackQuery) -> None:
     else:
         text = f"To top up balance, contact @{SUPPORT_USERNAME}." if lang == "en" else f"Для пополнения баланса обратитесь к @{SUPPORT_USERNAME}."
     await callback.message.answer(text, reply_markup=back_menu_keyboard(lang))
+
+
+@router.callback_query(F.data == "balance:history")
+async def balance_history(callback: CallbackQuery) -> None:
+    await callback.answer()
+    lang = get_user_lang(callback.from_user.id)
+    if lang == "en":
+        text = "📜 <b>Balance history</b>\n\n" + balance_history_lines(callback.from_user.id)
+    else:
+        text = "📜 <b>История баланса</b>\n\n" + balance_history_lines(callback.from_user.id)
+    await callback.message.answer(text, reply_markup=back_menu_keyboard(lang), parse_mode=ParseMode.HTML)
 
 
 @router.callback_query(F.data == "language")
@@ -1050,6 +1219,96 @@ async def security(callback: CallbackQuery) -> None:
             "<blockquote>• После проверки покупатель подтверждает получение и ордер закрывается</blockquote>"
         )
     await callback.message.answer(text, reply_markup=back_menu_keyboard(lang), parse_mode=ParseMode.HTML)
+
+
+def top_keyboard(lang: str) -> InlineKeyboardMarkup:
+    if lang == "en":
+        rows = [
+            [button("👥 Team profiles", callback_data="top:staff")],
+            [button("🔗 By orders", callback_data="top:orders"), button("💎 By volume", callback_data="top:volume")],
+            [button("◀️ Menu", callback_data="menu")],
+        ]
+    else:
+        rows = [
+            [button("👥 Профили команды", callback_data="top:staff")],
+            [button("🔗 По сделкам", callback_data="top:orders"), button("💎 По обороту", callback_data="top:volume")],
+            [button("◀️ В меню", callback_data="menu")],
+        ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def format_top_rows(rows: list[sqlite3.Row], mode: str, lang: str) -> str:
+    if not rows:
+        return "No users yet." if lang == "en" else "Пока нет пользователей в топе."
+    lines = []
+    for index, row in enumerate(rows, 1):
+        orders = int(row["success_orders"])
+        volume = float(row["success_volume"])
+        level = seller_level(orders, volume, lang)
+        metric = f"{orders} orders" if mode == "orders" and lang == "en" else f"{orders} ордеров"
+        if mode == "volume":
+            metric = f"{money(volume)} Stars"
+        lines.append(f"{index}. <b>{public_name(row)}</b> — {metric}\n   {level}, рейтинг {float(row['rating']):.1f}")
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data == "top")
+async def top_menu(callback: CallbackQuery) -> None:
+    await callback.answer()
+    lang = get_user_lang(callback.from_user.id)
+    if lang == "en":
+        text = "📊 <b>Top users</b>\n\nChoose what to show:"
+    else:
+        text = "📊 <b>Топ пользователей</b>\n\nВыбери, что показать:"
+    await callback.message.answer(text, reply_markup=top_keyboard(lang), parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.in_({"top:orders", "top:volume"}))
+async def top_users_view(callback: CallbackQuery) -> None:
+    await callback.answer()
+    lang = get_user_lang(callback.from_user.id)
+    mode = "volume" if callback.data.endswith(":volume") else "orders"
+    title = "💎 <b>Top by volume</b>" if mode == "volume" and lang == "en" else "🔗 <b>Top by orders</b>"
+    if lang == "ru":
+        title = "💎 <b>Топ по обороту</b>" if mode == "volume" else "🔗 <b>Топ по сделкам</b>"
+    await callback.message.answer(
+        f"{title}\n\n{format_top_rows(top_users(mode), mode, lang)}",
+        reply_markup=top_keyboard(lang),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.callback_query(F.data == "top:staff")
+async def staff_profiles_view(callback: CallbackQuery) -> None:
+    await callback.answer()
+    lang = get_user_lang(callback.from_user.id)
+    rows = staff_profiles()
+    if not rows:
+        text = "👥 <b>Team profiles</b>\n\nTeam list is empty." if lang == "en" else "👥 <b>Профили команды</b>\n\nСписок команды пуст."
+    else:
+        header = "👥 <b>Team profiles</b>" if lang == "en" else "👥 <b>Профили команды</b>"
+        parts = [header]
+        for row in rows:
+            orders = int(row["success_orders"])
+            volume = float(row["success_volume"])
+            if lang == "en":
+                parts.append(
+                    f"<b>{public_name(row)}</b>\n"
+                    f"🏅 {seller_level(orders, volume, lang)}\n"
+                    f"🔗 Orders: {orders}\n"
+                    f"💎 Volume: {money(volume)} Stars\n"
+                    f"⚭ Rating: {float(row['rating']):.1f}"
+                )
+            else:
+                parts.append(
+                    f"<b>{public_name(row)}</b>\n"
+                    f"🏅 {seller_level(orders, volume, lang)}\n"
+                    f"🔗 Ордеров: {orders}\n"
+                    f"💎 Оборот: {money(volume)} Stars\n"
+                    f"⚭ Рейтинг: {float(row['rating']):.1f}"
+                )
+        text = "\n\n".join(parts)
+    await callback.message.answer(text, reply_markup=top_keyboard(lang), parse_mode=ParseMode.HTML)
 
 
 @router.callback_query(F.data.in_({"deals:mine", "top:sellers", "refs"}))
@@ -1111,8 +1370,8 @@ async def add_balance_from_parts(message: Message, parts: list[str]) -> None:
     if currency not in CURRENCIES:
         await message.answer("Валюта должна быть одной из: Stars, TON, USDT, RUB")
         return
-    add_balance(user_id, value, currency)
     admin = message.from_user
+    add_balance(user_id, value, currency, reason="manual_topup", actor_id=admin.id if admin else None)
     logger.info(
         "balance_added admin_id=%s admin_username=%s target_user_id=%s amount=%s currency=%s",
         admin.id if admin else None,
@@ -1249,3 +1508,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
