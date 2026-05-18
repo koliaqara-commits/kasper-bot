@@ -1224,13 +1224,11 @@ async def security(callback: CallbackQuery) -> None:
 def top_keyboard(lang: str) -> InlineKeyboardMarkup:
     if lang == "en":
         rows = [
-            [button("👥 Team profiles", callback_data="top:staff")],
             [button("🔗 By orders", callback_data="top:orders"), button("💎 By volume", callback_data="top:volume")],
             [button("◀️ Menu", callback_data="menu")],
         ]
     else:
         rows = [
-            [button("👥 Профили команды", callback_data="top:staff")],
             [button("🔗 По сделкам", callback_data="top:orders"), button("💎 По обороту", callback_data="top:volume")],
             [button("◀️ В меню", callback_data="menu")],
         ]
@@ -1508,4 +1506,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
