@@ -463,14 +463,14 @@ def main_menu(lang: str = "ru") -> InlineKeyboardMarkup:
         rows = [
             [button("🆕 Create order", callback_data="deal:create", style="success")],
             [button("💳 Balance", callback_data="topup"), button("🔔 Security", callback_data="requisites")],
-            [button("💙 Referrals", callback_data="refs"), button("🚘 Profile", callback_data="profile")],
+            [button("💙 Referrals", callback_data="refs"), button("👤 Profile", callback_data="profile")],
             [button("💬 Support", url=f"https://t.me/{SUPPORT_USERNAME}"), button("🔵 Language", callback_data="language")],
         ]
     else:
         rows = [
             [button("🆕 Создать ордер", callback_data="deal:create", style="success")],
             [button("💳 Баланс", callback_data="topup"), button("🔔 Безопасность", callback_data="requisites")],
-            [button("💙 Рефералы", callback_data="refs"), button("🚘 Профиль", callback_data="profile")],
+            [button("💙 Рефералы", callback_data="refs"), button("👤 Профиль", callback_data="profile")],
             [button("💬 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}"), button("🔵 Язык", callback_data="language")],
         ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -653,7 +653,7 @@ async def handle_admin_command_in_state(message: Message, state: FSMContext) -> 
             await message.answer("Формат: /setstats <telegram_id> <orders> <rating> [volume]")
             return True
         set_user_stats(target_id, orders, rating, volume)
-        await message.answer(f"✅ Статистика <code>{target_id}</code>: ордеров {orders}, рейтинг {rating:.1f}, сумма {money(volume)}", parse_mode=ParseMode.HTML)
+        await message.answer(f"✅ Статистика <code>{target_id}</code>: ордеров {orders}, рейтинг {rating:.1f}, сумма {money(volume)} Stars", parse_mode=ParseMode.HTML)
         return True
 
     await message.answer("Неизвестная команда. Нажмите /admin.")
@@ -973,7 +973,7 @@ async def profile(callback: CallbackQuery) -> None:
             f"📦 ID: <code>{user.id}</code>\n\n"
             f"⚭ Rating: {rating:.1f}\n\n"
             f"🔗 Successful orders: {orders}\n\n"
-            f"💎 Successful deals volume: {money(volume)}"
+            f"💎 Successful deals volume: {money(volume)} Stars"
         )
     else:
         text = (
@@ -982,7 +982,7 @@ async def profile(callback: CallbackQuery) -> None:
             f"📦 ID: <code>{user.id}</code>\n\n"
             f"⚭ Рейтинг: {rating:.1f}\n\n"
             f"🔗 Успешных ордеров: {orders}\n\n"
-            f"💎 Сумма успешных сделок: {money(volume)}"
+            f"💎 Сумма успешных сделок: {money(volume)} Stars"
         )
     await callback.message.answer(text, parse_mode=ParseMode.HTML)
 
@@ -1213,7 +1213,7 @@ async def admin_set_stats(message: Message, command: CommandObject) -> None:
         return
     set_user_stats(user_id, orders, rating, volume)
     logger.info("stats_set admin_id=%s target=%s orders=%s rating=%s volume=%s", message.from_user.id, user_id, orders, rating, volume)
-    await message.answer(f"✅ Статистика <code>{user_id}</code>: ордеров {orders}, рейтинг {rating:.1f}, сумма {money(volume)}", parse_mode=ParseMode.HTML)
+    await message.answer(f"✅ Статистика <code>{user_id}</code>: ордеров {orders}, рейтинг {rating:.1f}, сумма {money(volume)} Stars", parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("balance"))
