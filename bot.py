@@ -117,11 +117,20 @@ def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY,
+                added_by INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(users)").fetchall()}
         if "lang" not in columns:
             connection.execute("ALTER TABLE users ADD COLUMN lang TEXT NOT NULL DEFAULT 'ru'")
+        deal_columns = {row["name"] for row in connection.execute("PRAGMA table_info(deals)").fetchall()}
+        if "status" not in deal_columns:
+            connection.execute("ALTER TABLE deals ADD COLUMN status TEXT NOT NULL DEFAULT 'created'")
         connection.execute("INSERT OR IGNORE INTO settings(key, value) VALUES('payment_url', ?)", (PAYMENT_URL,))
         connection.commit()
 
@@ -244,6 +253,33 @@ def pay_deal_from_balance(tag: str, user_id: int, lang: str = "ru") -> tuple[boo
     return True, f"✅ Deal #{tag} paid from balance." if lang == "en" else f"✅ Сделка #{tag} оплачена с баланса."
 
 
+def release_deal_to_seller(tag: str) -> tuple[bool, str, Deal | None]:
+    deal = find_deal(tag)
+    if not deal:
+        return False, "Сделка не найдена.", None
+    if deal.status == "completed":
+        return False, "Сделка уже завершена.", deal
+    if deal.status != "paid":
+        return False, "Сделка еще не оплачена.", deal
+    add_balance(deal.seller_id, deal.amount, deal.currency)
+    with closing(db()) as connection:
+        connection.execute("UPDATE deals SET status = 'completed' WHERE tag = ?", (tag,))
+        connection.commit()
+    logger.info("deal_completed tag=%s seller_id=%s amount=%s currency=%s", tag, deal.seller_id, deal.amount, deal.currency)
+    return True, "✅ Получение подтверждено. Баланс продавца пополнен.", deal
+
+
+def receipt_keyboard(deal: Deal, lang: str) -> InlineKeyboardMarkup:
+    yes = "✅ Yes, received" if lang == "en" else "✅ Да, получил"
+    no = "❌ No" if lang == "en" else "❌ Нет"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [button(yes, callback_data=f"receipt:yes:{deal.tag}", style="success")],
+            [button(no, callback_data=f"receipt:no:{deal.tag}", style="danger")],
+        ]
+    )
+
+
 def create_tag() -> str:
     return "MUM" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
 
@@ -319,11 +355,28 @@ def find_deal(tag: str) -> Deal | None:
 
 
 def is_admin(user_id: int) -> bool:
+    if user_id in ADMIN_IDS:
+        return True
+    with closing(db()) as connection:
+        row = connection.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,)).fetchone()
+    return bool(row)
+
+
+def is_owner(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
 def is_staff(user_id: int) -> bool:
-    return user_id in ADMIN_IDS or user_id in WORKER_IDS
+    return is_admin(user_id) or user_id in WORKER_IDS
+
+
+def add_admin(user_id: int, added_by: int) -> None:
+    with closing(db()) as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO admins(user_id, added_by) VALUES(?, ?)",
+            (user_id, added_by),
+        )
+        connection.commit()
 
 
 def money(value: float) -> str:
@@ -338,14 +391,14 @@ def main_menu(lang: str = "ru") -> InlineKeyboardMarkup:
     if lang == "en":
         rows = [
             [button("🆕 Create order", callback_data="deal:create", style="success")],
-            [button("💳 Balance", callback_data="profile"), button("🔔 Security", callback_data="requisites", style="success")],
+            [button("💳 Balance", callback_data="profile"), button("🔔 Security", callback_data="requisites")],
             [button("💙 Referrals", callback_data="refs"), button("📦 My deals", callback_data="deals:mine")],
             [button("💬 Support", url=f"https://t.me/{SUPPORT_USERNAME}"), button("🔵 Language", callback_data="language")],
         ]
     else:
         rows = [
             [button("🆕 Создать ордер", callback_data="deal:create", style="success")],
-            [button("💳 Баланс", callback_data="profile"), button("🔔 Безопасность", callback_data="requisites", style="success")],
+            [button("💳 Баланс", callback_data="profile"), button("🔔 Безопасность", callback_data="requisites")],
             [button("💙 Рефералы", callback_data="refs"), button("📦 Мои сделки", callback_data="deals:mine")],
             [button("💬 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}"), button("🔵 Язык", callback_data="language")],
         ]
@@ -387,6 +440,22 @@ def language_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [button("🇷🇺 Русский", callback_data="lang:ru"), button("🇬🇧 English", callback_data="lang:en")],
+            [button("◀️ В меню", callback_data="menu")],
+        ]
+    )
+
+
+def balance_actions_keyboard(lang: str) -> InlineKeyboardMarkup:
+    if lang == "en":
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [button("💎 Withdraw balance", callback_data="balance:withdraw"), button("💎 Top up balance", callback_data="balance:topup", style="success")],
+                [button("◀️ Menu", callback_data="menu")],
+            ]
+        )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [button("💎 Вывести баланс", callback_data="balance:withdraw"), button("💎 Пополнить баланс", callback_data="balance:topup", style="success")],
             [button("◀️ В меню", callback_data="menu")],
         ]
     )
@@ -484,6 +553,18 @@ async def handle_admin_command_in_state(message: Message, state: FSMContext) -> 
         return True
     if command == "/setpaylink":
         await set_paylink_from_parts(message, parts[1:])
+        return True
+    if command == "/addadmin":
+        if not is_owner(user.id):
+            await message.answer("Нет доступа. Добавлять админов может только главный админ.")
+            return True
+        try:
+            new_admin_id = int(parts[1])
+        except (IndexError, ValueError):
+            await message.answer("Формат: /addadmin <telegram_id>")
+            return True
+        add_admin(new_admin_id, user.id)
+        await message.answer(f"✅ Админ <code>{new_admin_id}</code> добавлен.", parse_mode=ParseMode.HTML)
         return True
 
     await message.answer("Неизвестная команда. Нажмите /admin.")
@@ -722,6 +803,18 @@ async def pay_deal(callback: CallbackQuery) -> None:
         else:
             buyer_text = f"{result}\n\n💰 Списано: <b>{money(deal.amount)} {deal.currency}</b>\n📦 Сделка: <b>#{deal.tag}</b>"
         await callback.message.answer(buyer_text, parse_mode=ParseMode.HTML)
+        if lang == "en":
+            await callback.message.answer(
+                "📦 <b>Did you receive the item?</b>\n\nConfirm only after the item is actually received.",
+                reply_markup=receipt_keyboard(deal, lang),
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await callback.message.answer(
+                "📦 <b>Вы получили товар?</b>\n\nПодтверждайте только после фактического получения товара.",
+                reply_markup=receipt_keyboard(deal, lang),
+                parse_mode=ParseMode.HTML,
+            )
         seller_lang = get_user_lang(deal.seller_id)
         if seller_lang == "en":
             seller_text = (
@@ -740,6 +833,41 @@ async def pay_deal(callback: CallbackQuery) -> None:
         await callback.bot.send_message(deal.seller_id, seller_text, parse_mode=ParseMode.HTML)
 
 
+@router.callback_query(F.data.startswith("receipt:"))
+async def receipt(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Ошибка.", show_alert=True)
+        return
+    action, tag = parts[1], parts[2]
+    lang = get_user_lang(callback.from_user.id)
+    deal = find_deal(tag)
+    if not deal:
+        await callback.answer("Deal not found." if lang == "en" else "Сделка не найдена.", show_alert=True)
+        return
+    if (callback.from_user.username or "").lower() != deal.buyer_username.lower() and not is_staff(callback.from_user.id):
+        await callback.answer("This confirmation is not for you." if lang == "en" else "Это подтверждение не для вас.", show_alert=True)
+        return
+    if action == "no":
+        await callback.answer("Support has been notified." if lang == "en" else "Обратитесь в поддержку.", show_alert=True)
+        await callback.message.answer(
+            f"💬 @{SUPPORT_USERNAME}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button("💬 Support" if lang == "en" else "💬 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}")]]),
+        )
+        return
+
+    ok, result, deal = release_deal_to_seller(tag)
+    await callback.answer(result, show_alert=True)
+    await callback.message.answer(result)
+    if ok and deal:
+        seller_lang = get_user_lang(deal.seller_id)
+        if seller_lang == "en":
+            text = f"✅ Deal #{deal.tag} completed.\nYour balance was topped up by {money(deal.amount)} {deal.currency}."
+        else:
+            text = f"✅ Сделка #{deal.tag} завершена.\nВаш баланс пополнен на {money(deal.amount)} {deal.currency}."
+        await callback.bot.send_message(deal.seller_id, text)
+
+
 @router.callback_query(F.data == "profile")
 async def profile(callback: CallbackQuery) -> None:
     await callback.answer()
@@ -749,7 +877,18 @@ async def profile(callback: CallbackQuery) -> None:
         text = f"💎 <b>Kasper Balance</b>\n\nID: <code>{user.id}</code>\nUsername: @{user.username or 'none'}\n\n<b>Balances:</b>\n{balance_lines(user.id)}"
     else:
         text = f"💎 <b>Баланс Kasper</b>\n\nID: <code>{user.id}</code>\nUsername: @{user.username or 'нет'}\n\n<b>Балансы:</b>\n{balance_lines(user.id)}"
-    await callback.message.answer(text, parse_mode=ParseMode.HTML)
+    await callback.message.answer(text, reply_markup=balance_actions_keyboard(lang), parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.in_({"balance:withdraw", "balance:topup"}))
+async def balance_action(callback: CallbackQuery) -> None:
+    await callback.answer()
+    lang = get_user_lang(callback.from_user.id)
+    if callback.data == "balance:withdraw":
+        text = "Withdrawal request created. Manager will contact you soon." if lang == "en" else "Заявка на вывод создана. Менеджер скоро свяжется с вами."
+    else:
+        text = f"To top up balance, contact @{SUPPORT_USERNAME}." if lang == "en" else f"Для пополнения баланса обратитесь к @{SUPPORT_USERNAME}."
+    await callback.message.answer(text, reply_markup=back_menu_keyboard(lang))
 
 
 @router.callback_query(F.data == "language")
@@ -830,11 +969,16 @@ async def stale_deal_step(message: Message) -> None:
 
 
 async def send_admin_help(message: Message) -> None:
+    owner_extra = "\n/addadmin &lt;telegram_id&gt;" if message.from_user and is_owner(message.from_user.id) else ""
     await message.answer(
-        "<b>Админ-панель</b>\n\n"
+        "<b>Админ-панель Kasper</b>\n\n"
+        "<b>Баланс:</b>\n"
         "/addbalance &lt;telegram_id&gt; &lt;amount&gt; [Stars|TON|USDT|RUB]\n"
-        "/balance &lt;telegram_id&gt;\n"
-        "/setpaylink &lt;url&gt;",
+        "/balance &lt;telegram_id&gt;\n\n"
+        "<b>Настройки:</b>\n"
+        "/setpaylink &lt;url&gt;\n"
+        "/emoji_id"
+        f"{owner_extra}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -919,6 +1063,21 @@ async def admin_add_balance(message: Message, command: CommandObject) -> None:
         await message.answer("Нет доступа.")
         return
     await add_balance_from_parts(message, (command.args or "").split())
+
+
+@router.message(Command("addadmin"))
+async def admin_add_admin(message: Message, command: CommandObject) -> None:
+    if not message.from_user or not is_owner(message.from_user.id):
+        await message.answer("Нет доступа. Добавлять админов может только главный админ.")
+        return
+    try:
+        user_id = int((command.args or "").strip())
+    except ValueError:
+        await message.answer("Формат: /addadmin <telegram_id>")
+        return
+    add_admin(user_id, message.from_user.id)
+    logger.info("admin_added owner_id=%s new_admin_id=%s", message.from_user.id, user_id)
+    await message.answer(f"✅ Админ <code>{user_id}</code> добавлен.", parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("balance"))
