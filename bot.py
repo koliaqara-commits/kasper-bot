@@ -89,6 +89,8 @@ def init_db() -> None:
                 username TEXT,
                 first_name TEXT,
                 lang TEXT NOT NULL DEFAULT 'ru',
+                rating REAL NOT NULL DEFAULT 0,
+                success_orders INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -128,6 +130,10 @@ def init_db() -> None:
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(users)").fetchall()}
         if "lang" not in columns:
             connection.execute("ALTER TABLE users ADD COLUMN lang TEXT NOT NULL DEFAULT 'ru'")
+        if "rating" not in columns:
+            connection.execute("ALTER TABLE users ADD COLUMN rating REAL NOT NULL DEFAULT 0")
+        if "success_orders" not in columns:
+            connection.execute("ALTER TABLE users ADD COLUMN success_orders INTEGER NOT NULL DEFAULT 0")
         deal_columns = {row["name"] for row in connection.execute("PRAGMA table_info(deals)").fetchall()}
         if "status" not in deal_columns:
             connection.execute("ALTER TABLE deals ADD COLUMN status TEXT NOT NULL DEFAULT 'created'")
@@ -168,6 +174,64 @@ def set_user_lang(user_id: int, lang: str) -> None:
             (user_id, lang if lang in {"ru", "en"} else "ru"),
         )
         connection.commit()
+
+
+def get_user_stats(user_id: int) -> sqlite3.Row | None:
+    with closing(db()) as connection:
+        return connection.execute(
+            "SELECT rating, success_orders FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+
+
+def set_user_stats(user_id: int, orders: int, rating: float) -> None:
+    with closing(db()) as connection:
+        connection.execute(
+            """
+            INSERT INTO users(id, rating, success_orders)
+            VALUES(?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                rating = excluded.rating,
+                success_orders = excluded.success_orders
+            """,
+            (user_id, rating, orders),
+        )
+        connection.commit()
+
+
+def increment_success_orders(user_id: int) -> None:
+    with closing(db()) as connection:
+        connection.execute(
+            """
+            INSERT INTO users(id, success_orders)
+            VALUES(?, 1)
+            ON CONFLICT(id) DO UPDATE SET success_orders = success_orders + 1
+            """,
+            (user_id,),
+        )
+        connection.commit()
+
+
+def requisites_status(user_id: int) -> str:
+    has_any = any(get_balance(user_id, currency) > 0 for currency in CURRENCIES)
+    return "заполнены" if has_any else "не указаны"
+
+
+def total_deals_volume(user_id: int) -> str:
+    with closing(db()) as connection:
+        rows = connection.execute(
+            """
+            SELECT currency, COALESCE(SUM(amount), 0) AS total
+            FROM deals
+            WHERE seller_id = ?
+            GROUP BY currency
+            ORDER BY currency
+            """,
+            (user_id,),
+        ).fetchall()
+    totals = {row["currency"]: float(row["total"]) for row in rows}
+    parts = [f"{money(totals[currency])} {currency}" for currency in CURRENCIES if totals.get(currency, 0) > 0]
+    return ", ".join(parts) if parts else "0"
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -262,6 +326,7 @@ def release_deal_to_seller(tag: str) -> tuple[bool, str, Deal | None]:
     if deal.status != "paid":
         return False, "Сделка еще не оплачена.", deal
     add_balance(deal.seller_id, deal.amount, deal.currency)
+    increment_success_orders(deal.seller_id)
     with closing(db()) as connection:
         connection.execute("UPDATE deals SET status = 'completed' WHERE tag = ?", (tag,))
         connection.commit()
@@ -391,14 +456,14 @@ def main_menu(lang: str = "ru") -> InlineKeyboardMarkup:
     if lang == "en":
         rows = [
             [button("🆕 Create order", callback_data="deal:create", style="success")],
-            [button("💳 Balance", callback_data="profile"), button("🔔 Security", callback_data="requisites")],
+            [button("💳 Balance", callback_data="topup"), button("🔔 Security", callback_data="requisites")],
             [button("💙 Referrals", callback_data="refs"), button("📦 My deals", callback_data="deals:mine")],
             [button("💬 Support", url=f"https://t.me/{SUPPORT_USERNAME}"), button("🔵 Language", callback_data="language")],
         ]
     else:
         rows = [
             [button("🆕 Создать ордер", callback_data="deal:create", style="success")],
-            [button("💳 Баланс", callback_data="profile"), button("🔔 Безопасность", callback_data="requisites")],
+            [button("💳 Баланс", callback_data="topup"), button("🔔 Безопасность", callback_data="requisites")],
             [button("💙 Рефералы", callback_data="refs"), button("📦 Мои сделки", callback_data="deals:mine")],
             [button("💬 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}"), button("🔵 Язык", callback_data="language")],
         ]
@@ -439,9 +504,15 @@ def back_menu_keyboard(lang: str = "ru") -> InlineKeyboardMarkup:
 def language_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [button("🇷🇺 Русский", callback_data="lang:ru"), button("🇬🇧 English", callback_data="lang:en")],
-            [button("◀️ В меню", callback_data="menu")],
+            [button("🇷🇺 Русский", callback_data="lang:ru"), button("🇺🇸 English", callback_data="lang:en")],
         ]
+    )
+
+
+async def send_language_choice(message: Message) -> None:
+    await message.answer(
+        "Выберите язык / Choose language",
+        reply_markup=language_keyboard(),
     )
 
 
@@ -566,6 +637,17 @@ async def handle_admin_command_in_state(message: Message, state: FSMContext) -> 
         add_admin(new_admin_id, user.id)
         await message.answer(f"✅ Админ <code>{new_admin_id}</code> добавлен.", parse_mode=ParseMode.HTML)
         return True
+    if command == "/setstats":
+        try:
+            target_id = int(parts[1])
+            orders = int(parts[2])
+            rating = float(parts[3].replace(",", "."))
+        except (IndexError, ValueError):
+            await message.answer("Формат: /setstats <telegram_id> <orders> <rating>")
+            return True
+        set_user_stats(target_id, orders, rating)
+        await message.answer(f"✅ Статистика <code>{target_id}</code>: ордеров {orders}, рейтинг {rating:.1f}", parse_mode=ParseMode.HTML)
+        return True
 
     await message.answer("Неизвестная команда. Нажмите /admin.")
     return True
@@ -578,7 +660,7 @@ async def start(message: Message, command: CommandObject) -> None:
     if args.startswith("deal_"):
         await show_deal(message, args.removeprefix("deal_"))
         return
-    await send_menu(message)
+    await send_language_choice(message)
 
 
 @router.callback_query(F.data == "menu")
@@ -873,10 +955,39 @@ async def profile(callback: CallbackQuery) -> None:
     await callback.answer()
     user = callback.from_user
     lang = get_user_lang(user.id)
+    stats = get_user_stats(user.id)
+    rating = float(stats["rating"]) if stats else 0.0
+    orders = int(stats["success_orders"]) if stats else 0
+    volume = total_deals_volume(user.id)
     if lang == "en":
-        text = f"💎 <b>Kasper Balance</b>\n\nID: <code>{user.id}</code>\nUsername: @{user.username or 'none'}\n\n<b>Balances:</b>\n{balance_lines(user.id)}"
+        text = (
+            "🚘 <b>Profile</b>\n\n"
+            f"🎩 Username: @{user.username or 'none'}\n\n"
+            f"📦 ID: <code>{user.id}</code>\n\n"
+            f"⚭ Rating: {rating:.1f}\n\n"
+            f"🔗 Successful orders: {orders}\n\n"
+            f"💎 Total order volume: {volume}"
+        )
     else:
-        text = f"💎 <b>Баланс Kasper</b>\n\nID: <code>{user.id}</code>\nUsername: @{user.username or 'нет'}\n\n<b>Балансы:</b>\n{balance_lines(user.id)}"
+        text = (
+            "🚘 <b>Профиль</b>\n\n"
+            f"🎩 Username: @{user.username or 'нет'}\n\n"
+            f"📦 ID: <code>{user.id}</code>\n\n"
+            f"⚭ Рейтинг: {rating:.1f}\n\n"
+            f"🔗 Успешных ордеров: {orders}\n\n"
+            f"💎 Общая сумма ордеров: {volume}"
+        )
+    await callback.message.answer(text, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data == "topup")
+async def balance_view(callback: CallbackQuery) -> None:
+    await callback.answer()
+    lang = get_user_lang(callback.from_user.id)
+    if lang == "en":
+        text = f"💎 <b>Kasper Balance</b>\n\n<b>Balances:</b>\n{balance_lines(callback.from_user.id)}"
+    else:
+        text = f"💎 <b>Баланс Kasper</b>\n\n<b>Балансы:</b>\n{balance_lines(callback.from_user.id)}"
     await callback.message.answer(text, reply_markup=balance_actions_keyboard(lang), parse_mode=ParseMode.HTML)
 
 
@@ -908,9 +1019,6 @@ async def set_language(callback: CallbackQuery) -> None:
     lang = "ru" if callback.data.endswith(":ru") else "en"
     set_user_lang(callback.from_user.id, lang)
     await callback.answer("Language saved" if lang == "en" else "Язык сохранён")
-    language_name = "Русский" if lang == "ru" else "English"
-    text = f"✅ Selected language: <b>{language_name}</b>" if lang == "en" else f"✅ Выбран язык: <b>{language_name}</b>"
-    await callback.message.answer(text, reply_markup=back_menu_keyboard(lang), parse_mode=ParseMode.HTML)
     await callback.message.answer(welcome_text(lang), reply_markup=main_menu(lang), parse_mode=ParseMode.HTML)
 
 
@@ -937,20 +1045,18 @@ async def security(callback: CallbackQuery) -> None:
     await callback.message.answer(text, reply_markup=back_menu_keyboard(lang), parse_mode=ParseMode.HTML)
 
 
-@router.callback_query(F.data.in_({"topup", "deals:mine", "top:sellers", "refs"}))
+@router.callback_query(F.data.in_({"deals:mine", "top:sellers", "refs"}))
 async def placeholders(callback: CallbackQuery) -> None:
     await callback.answer()
     lang = get_user_lang(callback.from_user.id)
     if lang == "en":
         messages = {
-            "topup": f"💳 <b>Your balances:</b>\n{balance_lines(callback.from_user.id)}\n\nTop-ups are made by a manager or administrator.",
             "deals:mine": "📦 Deal history will appear here soon.",
             "top:sellers": "🏆 Trader rating will open soon.",
             "refs": "🔗 Referral system will be available soon.",
         }
     else:
         messages = {
-            "topup": f"💳 <b>Ваши балансы:</b>\n{balance_lines(callback.from_user.id)}\n\nПополнение выполняет менеджер или администратор.",
             "deals:mine": "📦 История сделок скоро появится в этом разделе.",
             "top:sellers": "🏆 Рейтинг трейдеров скоро будет открыт.",
             "refs": "🔗 Реферальная система скоро будет доступна.",
@@ -974,7 +1080,8 @@ async def send_admin_help(message: Message) -> None:
         "<b>Админ-панель Kasper</b>\n\n"
         "<b>Баланс:</b>\n"
         "/addbalance &lt;telegram_id&gt; &lt;amount&gt; [Stars|TON|USDT|RUB]\n"
-        "/balance &lt;telegram_id&gt;\n\n"
+        "/balance &lt;telegram_id&gt;\n"
+        "/setstats &lt;telegram_id&gt; &lt;orders&gt; &lt;rating&gt;\n\n"
         "<b>Настройки:</b>\n"
         "/setpaylink &lt;url&gt;\n"
         "/emoji_id"
@@ -1078,6 +1185,27 @@ async def admin_add_admin(message: Message, command: CommandObject) -> None:
     add_admin(user_id, message.from_user.id)
     logger.info("admin_added owner_id=%s new_admin_id=%s", message.from_user.id, user_id)
     await message.answer(f"✅ Админ <code>{user_id}</code> добавлен.", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("setstats"))
+async def admin_set_stats(message: Message, command: CommandObject) -> None:
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+    parts = (command.args or "").split()
+    if len(parts) != 3:
+        await message.answer("Формат: /setstats <telegram_id> <orders> <rating>")
+        return
+    try:
+        user_id = int(parts[0])
+        orders = int(parts[1])
+        rating = float(parts[2].replace(",", "."))
+    except ValueError:
+        await message.answer("ID, ордера и рейтинг должны быть числами.")
+        return
+    set_user_stats(user_id, orders, rating)
+    logger.info("stats_set admin_id=%s target=%s orders=%s rating=%s", message.from_user.id, user_id, orders, rating)
+    await message.answer(f"✅ Статистика <code>{user_id}</code>: ордеров {orders}, рейтинг {rating:.1f}", parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("balance"))
