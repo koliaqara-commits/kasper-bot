@@ -91,6 +91,7 @@ def init_db() -> None:
                 lang TEXT NOT NULL DEFAULT 'ru',
                 rating REAL NOT NULL DEFAULT 0,
                 success_orders INTEGER NOT NULL DEFAULT 0,
+                success_volume REAL NOT NULL DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -134,6 +135,8 @@ def init_db() -> None:
             connection.execute("ALTER TABLE users ADD COLUMN rating REAL NOT NULL DEFAULT 0")
         if "success_orders" not in columns:
             connection.execute("ALTER TABLE users ADD COLUMN success_orders INTEGER NOT NULL DEFAULT 0")
+        if "success_volume" not in columns:
+            connection.execute("ALTER TABLE users ADD COLUMN success_volume REAL NOT NULL DEFAULT 0")
         deal_columns = {row["name"] for row in connection.execute("PRAGMA table_info(deals)").fetchall()}
         if "status" not in deal_columns:
             connection.execute("ALTER TABLE deals ADD COLUMN status TEXT NOT NULL DEFAULT 'created'")
@@ -179,35 +182,38 @@ def set_user_lang(user_id: int, lang: str) -> None:
 def get_user_stats(user_id: int) -> sqlite3.Row | None:
     with closing(db()) as connection:
         return connection.execute(
-            "SELECT rating, success_orders FROM users WHERE id = ?",
+            "SELECT rating, success_orders, success_volume FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()
 
 
-def set_user_stats(user_id: int, orders: int, rating: float) -> None:
+def set_user_stats(user_id: int, orders: int, rating: float, volume: float = 0) -> None:
     with closing(db()) as connection:
         connection.execute(
             """
-            INSERT INTO users(id, rating, success_orders)
-            VALUES(?, ?, ?)
+            INSERT INTO users(id, rating, success_orders, success_volume)
+            VALUES(?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 rating = excluded.rating,
-                success_orders = excluded.success_orders
+                success_orders = excluded.success_orders,
+                success_volume = excluded.success_volume
             """,
-            (user_id, rating, orders),
+            (user_id, rating, orders, volume),
         )
         connection.commit()
 
 
-def increment_success_orders(user_id: int) -> None:
+def increment_success_orders(user_id: int, amount: float = 0) -> None:
     with closing(db()) as connection:
         connection.execute(
             """
-            INSERT INTO users(id, success_orders)
-            VALUES(?, 1)
-            ON CONFLICT(id) DO UPDATE SET success_orders = success_orders + 1
+            INSERT INTO users(id, success_orders, success_volume)
+            VALUES(?, 1, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                success_orders = success_orders + 1,
+                success_volume = success_volume + excluded.success_volume
             """,
-            (user_id,),
+            (user_id, amount),
         )
         connection.commit()
 
@@ -326,7 +332,7 @@ def release_deal_to_seller(tag: str) -> tuple[bool, str, Deal | None]:
     if deal.status != "paid":
         return False, "Сделка еще не оплачена.", deal
     add_balance(deal.seller_id, deal.amount, deal.currency)
-    increment_success_orders(deal.seller_id)
+    increment_success_orders(deal.seller_id, deal.amount)
     with closing(db()) as connection:
         connection.execute("UPDATE deals SET status = 'completed' WHERE tag = ?", (tag,))
         connection.commit()
@@ -457,14 +463,14 @@ def main_menu(lang: str = "ru") -> InlineKeyboardMarkup:
         rows = [
             [button("🆕 Create order", callback_data="deal:create", style="success")],
             [button("💳 Balance", callback_data="topup"), button("🔔 Security", callback_data="requisites")],
-            [button("💙 Referrals", callback_data="refs"), button("📦 My deals", callback_data="deals:mine")],
+            [button("💙 Referrals", callback_data="refs"), button("🚘 Profile", callback_data="profile")],
             [button("💬 Support", url=f"https://t.me/{SUPPORT_USERNAME}"), button("🔵 Language", callback_data="language")],
         ]
     else:
         rows = [
             [button("🆕 Создать ордер", callback_data="deal:create", style="success")],
             [button("💳 Баланс", callback_data="topup"), button("🔔 Безопасность", callback_data="requisites")],
-            [button("💙 Рефералы", callback_data="refs"), button("📦 Мои сделки", callback_data="deals:mine")],
+            [button("💙 Рефералы", callback_data="refs"), button("🚘 Профиль", callback_data="profile")],
             [button("💬 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}"), button("🔵 Язык", callback_data="language")],
         ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -642,11 +648,12 @@ async def handle_admin_command_in_state(message: Message, state: FSMContext) -> 
             target_id = int(parts[1])
             orders = int(parts[2])
             rating = float(parts[3].replace(",", "."))
+            volume = float(parts[4].replace(",", ".")) if len(parts) > 4 else 0
         except (IndexError, ValueError):
-            await message.answer("Формат: /setstats <telegram_id> <orders> <rating>")
+            await message.answer("Формат: /setstats <telegram_id> <orders> <rating> [volume]")
             return True
-        set_user_stats(target_id, orders, rating)
-        await message.answer(f"✅ Статистика <code>{target_id}</code>: ордеров {orders}, рейтинг {rating:.1f}", parse_mode=ParseMode.HTML)
+        set_user_stats(target_id, orders, rating, volume)
+        await message.answer(f"✅ Статистика <code>{target_id}</code>: ордеров {orders}, рейтинг {rating:.1f}, сумма {money(volume)}", parse_mode=ParseMode.HTML)
         return True
 
     await message.answer("Неизвестная команда. Нажмите /admin.")
@@ -958,7 +965,7 @@ async def profile(callback: CallbackQuery) -> None:
     stats = get_user_stats(user.id)
     rating = float(stats["rating"]) if stats else 0.0
     orders = int(stats["success_orders"]) if stats else 0
-    volume = total_deals_volume(user.id)
+    volume = float(stats["success_volume"]) if stats and "success_volume" in stats.keys() else 0.0
     if lang == "en":
         text = (
             "🚘 <b>Profile</b>\n\n"
@@ -966,7 +973,7 @@ async def profile(callback: CallbackQuery) -> None:
             f"📦 ID: <code>{user.id}</code>\n\n"
             f"⚭ Rating: {rating:.1f}\n\n"
             f"🔗 Successful orders: {orders}\n\n"
-            f"💎 Total order volume: {volume}"
+            f"💎 Successful deals volume: {money(volume)}"
         )
     else:
         text = (
@@ -975,7 +982,7 @@ async def profile(callback: CallbackQuery) -> None:
             f"📦 ID: <code>{user.id}</code>\n\n"
             f"⚭ Рейтинг: {rating:.1f}\n\n"
             f"🔗 Успешных ордеров: {orders}\n\n"
-            f"💎 Общая сумма ордеров: {volume}"
+            f"💎 Сумма успешных сделок: {money(volume)}"
         )
     await callback.message.answer(text, parse_mode=ParseMode.HTML)
 
@@ -1081,7 +1088,7 @@ async def send_admin_help(message: Message) -> None:
         "<b>Баланс:</b>\n"
         "/addbalance &lt;telegram_id&gt; &lt;amount&gt; [Stars|TON|USDT|RUB]\n"
         "/balance &lt;telegram_id&gt;\n"
-        "/setstats &lt;telegram_id&gt; &lt;orders&gt; &lt;rating&gt;\n\n"
+        "/setstats &lt;telegram_id&gt; &lt;orders&gt; &lt;rating&gt; [volume]\n\n"
         "<b>Настройки:</b>\n"
         "/setpaylink &lt;url&gt;\n"
         "/emoji_id"
@@ -1193,19 +1200,20 @@ async def admin_set_stats(message: Message, command: CommandObject) -> None:
         await message.answer("Нет доступа.")
         return
     parts = (command.args or "").split()
-    if len(parts) != 3:
-        await message.answer("Формат: /setstats <telegram_id> <orders> <rating>")
+    if len(parts) not in {3, 4}:
+        await message.answer("Формат: /setstats <telegram_id> <orders> <rating> [volume]")
         return
     try:
         user_id = int(parts[0])
         orders = int(parts[1])
         rating = float(parts[2].replace(",", "."))
+        volume = float(parts[3].replace(",", ".")) if len(parts) == 4 else 0
     except ValueError:
-        await message.answer("ID, ордера и рейтинг должны быть числами.")
+        await message.answer("ID, ордера, рейтинг и сумма должны быть числами.")
         return
-    set_user_stats(user_id, orders, rating)
-    logger.info("stats_set admin_id=%s target=%s orders=%s rating=%s", message.from_user.id, user_id, orders, rating)
-    await message.answer(f"✅ Статистика <code>{user_id}</code>: ордеров {orders}, рейтинг {rating:.1f}", parse_mode=ParseMode.HTML)
+    set_user_stats(user_id, orders, rating, volume)
+    logger.info("stats_set admin_id=%s target=%s orders=%s rating=%s volume=%s", message.from_user.id, user_id, orders, rating, volume)
+    await message.answer(f"✅ Статистика <code>{user_id}</code>: ордеров {orders}, рейтинг {rating:.1f}, сумма {money(volume)}", parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("balance"))
