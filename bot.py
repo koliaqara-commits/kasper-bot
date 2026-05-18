@@ -24,12 +24,12 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "KasperGiftSupport").lstrip("@")
+PAYMENT_URL = os.getenv("PAYMENT_URL", f"https://t.me/{SUPPORT_USERNAME}")
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "kasper.sqlite3"))
-ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-WORKER_IDS = {int(x.strip()) for x in os.getenv("WORKER_IDS", "").split(",") if x.strip().isdigit()}
+ADMIN_IDS = {int(item.strip()) for item in os.getenv("ADMIN_IDS", "").split(",") if item.strip().isdigit()}
+WORKER_IDS = {int(item.strip()) for item in os.getenv("WORKER_IDS", "").split(",") if item.strip().isdigit()}
 
-CURRENCIES = ["Stars", "TON", "RUB", "USDT"]
-TOPUP_CURRENCIES = ["Stars", "TON", "RUB", "USDT", "UAH", "USD", "BYN"]
+CURRENCIES = ["Stars", "TON", "USDT", "RUB"]
 
 logging.basicConfig(
     filename="kasper.log",
@@ -42,57 +42,54 @@ logger = logging.getLogger("kasper")
 router = Router()
 
 
-class OrderState(StatesGroup):
-    choosing_role = State()
-    choosing_item = State()
+class DealState(StatesGroup):
+    choosing_type = State()
+    waiting_link = State()
+    waiting_stars_count = State()
     choosing_currency = State()
-    waiting_recipient = State()
     waiting_amount = State()
-    waiting_description = State()
-    binding_requisite = State()
+    waiting_buyer = State()
 
 
 @dataclass
-class Order:
+class Deal:
     tag: str
-    creator_id: int
-    creator_username: str
-    role: str
-    item_type: str
-    currency: str
-    recipient: str
-    amount: float
-    description: str
+    seller_id: int
+    seller_username: str
     buyer_username: str
+    item_type: str
+    item_link: str
+    amount: float
+    currency: str
+    stars_count: int | None
     status: str
 
 
+DEAL_TYPES = {
+    "nft": "NFT-подарок",
+    "stars": "Звёзды",
+    "username": "NFT-username",
+    "crypto": "Крипта",
+    "premium": "Telegram Premium",
+}
+
+
 def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
 
 
 def init_db() -> None:
-    with closing(db()) as conn:
-        conn.executescript(
+    with closing(db()) as connection:
+        connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY,
                 username TEXT,
                 first_name TEXT,
                 lang TEXT NOT NULL DEFAULT 'ru',
-                rating REAL NOT NULL DEFAULT 0,
-                success_orders INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS requisites (
-                user_id INTEGER PRIMARY KEY,
-                usdt TEXT,
-                ton TEXT,
-                card TEXT,
-                stars_username TEXT
             );
 
             CREATE TABLE IF NOT EXISTS balances (
@@ -102,42 +99,39 @@ def init_db() -> None:
                 PRIMARY KEY (user_id, currency)
             );
 
-            CREATE TABLE IF NOT EXISTS orders (
+            CREATE TABLE IF NOT EXISTS deals (
                 tag TEXT PRIMARY KEY,
-                creator_id INTEGER NOT NULL,
-                creator_username TEXT NOT NULL,
-                role TEXT NOT NULL,
-                item_type TEXT NOT NULL,
-                currency TEXT NOT NULL,
-                recipient TEXT NOT NULL,
-                amount REAL NOT NULL,
-                description TEXT NOT NULL,
+                seller_id INTEGER NOT NULL,
+                seller_username TEXT NOT NULL,
                 buyer_username TEXT NOT NULL,
+                item_type TEXT NOT NULL,
+                item_link TEXT NOT NULL,
+                amount REAL NOT NULL,
+                currency TEXT NOT NULL,
+                stars_count INTEGER,
                 status TEXT NOT NULL DEFAULT 'created',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
-        for table, columns in {
-            "users": {
-                "lang": "TEXT NOT NULL DEFAULT 'ru'",
-                "rating": "REAL NOT NULL DEFAULT 0",
-                "success_orders": "INTEGER NOT NULL DEFAULT 0",
-            },
-            "requisites": {"stars_username": "TEXT"},
-        }.items():
-            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-            for name, definition in columns.items():
-                if name not in existing:
-                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
-        conn.commit()
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(users)").fetchall()}
+        if "lang" not in columns:
+            connection.execute("ALTER TABLE users ADD COLUMN lang TEXT NOT NULL DEFAULT 'ru'")
+        connection.execute("INSERT OR IGNORE INTO settings(key, value) VALUES('payment_url', ?)", (PAYMENT_URL,))
+        connection.commit()
 
 
-def remember_user(user) -> None:
+def remember_user(message: Message) -> None:
+    user = message.from_user
     if not user:
         return
-    with closing(db()) as conn:
-        conn.execute(
+    with closing(db()) as connection:
+        connection.execute(
             """
             INSERT INTO users(id, username, first_name)
             VALUES(?, ?, ?)
@@ -147,59 +141,44 @@ def remember_user(user) -> None:
             """,
             (user.id, user.username or "", user.first_name or ""),
         )
-        conn.execute("INSERT OR IGNORE INTO requisites(user_id) VALUES(?)", (user.id,))
-        conn.commit()
+        connection.commit()
 
 
-def get_lang(user_id: int | None) -> str:
+def get_user_lang(user_id: int | None) -> str:
     if not user_id:
         return "ru"
-    with closing(db()) as conn:
-        row = conn.execute("SELECT lang FROM users WHERE id = ?", (user_id,)).fetchone()
+    with closing(db()) as connection:
+        row = connection.execute("SELECT lang FROM users WHERE id = ?", (user_id,)).fetchone()
     return row["lang"] if row and row["lang"] in {"ru", "en"} else "ru"
 
 
-def set_lang(user_id: int, lang: str) -> None:
-    remember_user(type("User", (), {"id": user_id, "username": "", "first_name": ""})())
-    with closing(db()) as conn:
-        conn.execute("UPDATE users SET lang = ? WHERE id = ?", (lang, user_id))
-        conn.commit()
+def set_user_lang(user_id: int, lang: str) -> None:
+    with closing(db()) as connection:
+        connection.execute(
+            "INSERT INTO users(id, lang) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET lang = excluded.lang",
+            (user_id, lang if lang in {"ru", "en"} else "ru"),
+        )
+        connection.commit()
 
 
-def get_requisites(user_id: int) -> sqlite3.Row:
-    with closing(db()) as conn:
-        conn.execute("INSERT OR IGNORE INTO requisites(user_id) VALUES(?)", (user_id,))
-        conn.commit()
-        row = conn.execute("SELECT * FROM requisites WHERE user_id = ?", (user_id,)).fetchone()
-    return row
+def get_setting(key: str, default: str = "") -> str:
+    with closing(db()) as connection:
+        row = connection.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
 
 
-def set_requisite(user_id: int, field: str, value: str) -> None:
-    if field not in {"usdt", "ton", "card", "stars_username"}:
-        return
-    with closing(db()) as conn:
-        conn.execute("INSERT OR IGNORE INTO requisites(user_id) VALUES(?)", (user_id,))
-        conn.execute(f"UPDATE requisites SET {field} = ? WHERE user_id = ?", (value, user_id))
-        conn.commit()
-
-
-def missing_requisite(user_id: int, currency: str) -> tuple[str, str] | None:
-    req = get_requisites(user_id)
-    mapping = {
-        "Stars": ("stars_username", "получатель звезд"),
-        "TON": ("ton", "TON кошелек"),
-        "USDT": ("usdt", "USDT (TON) кошелек"),
-        "RUB": ("card", "карта/СПБ"),
-    }
-    field, label = mapping.get(currency, ("", ""))
-    if field and not req[field]:
-        return field, label
-    return None
+def set_setting(key: str, value: str) -> None:
+    with closing(db()) as connection:
+        connection.execute(
+            "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        connection.commit()
 
 
 def add_balance(user_id: int, amount: float, currency: str) -> None:
-    with closing(db()) as conn:
-        conn.execute(
+    with closing(db()) as connection:
+        connection.execute(
             """
             INSERT INTO balances(user_id, currency, amount)
             VALUES(?, ?, ?)
@@ -207,121 +186,143 @@ def add_balance(user_id: int, amount: float, currency: str) -> None:
             """,
             (user_id, currency, amount),
         )
-        conn.commit()
+        connection.commit()
 
 
 def get_balance(user_id: int, currency: str) -> float:
-    with closing(db()) as conn:
-        row = conn.execute("SELECT amount FROM balances WHERE user_id = ? AND currency = ?", (user_id, currency)).fetchone()
+    with closing(db()) as connection:
+        row = connection.execute(
+            "SELECT amount FROM balances WHERE user_id = ? AND currency = ?",
+            (user_id, currency),
+        ).fetchone()
     return float(row["amount"]) if row else 0.0
 
 
+def get_balances(user_id: int) -> list[sqlite3.Row]:
+    with closing(db()) as connection:
+        return connection.execute(
+            "SELECT currency, amount FROM balances WHERE user_id = ? ORDER BY currency",
+            (user_id,),
+        ).fetchall()
+
+
 def balance_lines(user_id: int) -> str:
-    return "\n".join(f"• {cur}: {money(get_balance(user_id, cur))}" for cur in CURRENCIES)
+    rows = {row["currency"]: float(row["amount"]) for row in get_balances(user_id)}
+    return "\n".join(f"• {currency}: {money(rows.get(currency, 0.0))}" for currency in CURRENCIES)
+
+
+def pay_deal_from_balance(tag: str, user_id: int, lang: str = "ru") -> tuple[bool, str]:
+    with closing(db()) as connection:
+        row = connection.execute("SELECT * FROM deals WHERE tag = ?", (tag,)).fetchone()
+        if not row:
+            return False, "Deal not found." if lang == "en" else "Сделка не найдена."
+        if row["status"] == "paid":
+            return False, "This deal is already paid." if lang == "en" else "Эта сделка уже оплачена."
+
+        current_balance = get_balance(user_id, row["currency"])
+        amount = float(row["amount"])
+        if current_balance < amount:
+            if lang == "en":
+                return False, (
+                    f"Not enough funds. Required: {money(amount)} {row['currency']}, "
+                    f"available: {money(current_balance)} {row['currency']}.\n\n"
+                    f"Your balances:\n{balance_lines(user_id)}"
+                )
+            return False, (
+                f"Недостаточно средств. Нужно {money(amount)} {row['currency']}, "
+                f"на балансе {money(current_balance)} {row['currency']}.\n\n"
+                f"Ваши балансы:\n{balance_lines(user_id)}"
+            )
+
+        connection.execute(
+            "UPDATE balances SET amount = amount - ? WHERE user_id = ? AND currency = ?",
+            (amount, user_id, row["currency"]),
+        )
+        connection.execute("UPDATE deals SET status = 'paid' WHERE tag = ?", (tag,))
+        connection.commit()
+
+    return True, f"✅ Deal #{tag} paid from balance." if lang == "en" else f"✅ Сделка #{tag} оплачена с баланса."
 
 
 def create_tag() -> str:
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    return "MUM" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
 
 
-def save_order(data: dict, user) -> Order:
+def save_deal(data: dict, seller_id: int, seller_username: str) -> Deal:
     tag = create_tag()
-    order = Order(
+    deal = Deal(
         tag=tag,
-        creator_id=user.id,
-        creator_username=user.username or str(user.id),
-        role=data["role"],
+        seller_id=seller_id,
+        seller_username=seller_username,
+        buyer_username=data["buyer_username"].lstrip("@"),
         item_type=data["item_type"],
-        currency=data["currency"],
-        recipient=data["recipient"],
+        item_link=data["item_link"],
         amount=float(data["amount"]),
-        description=data["description"],
-        buyer_username=data.get("buyer_username", data["recipient"].lstrip("@")),
+        currency=data["currency"],
+        stars_count=data.get("stars_count"),
         status="created",
     )
-    with closing(db()) as conn:
-        conn.execute(
+    with closing(db()) as connection:
+        connection.execute(
             """
-            INSERT INTO orders(tag, creator_id, creator_username, role, item_type, currency, recipient, amount, description, buyer_username, status)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO deals(
+                tag, seller_id, seller_username, buyer_username, item_type,
+                item_link, amount, currency, stars_count, status
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                order.tag,
-                order.creator_id,
-                order.creator_username,
-                order.role,
-                order.item_type,
-                order.currency,
-                order.recipient,
-                order.amount,
-                order.description,
-                order.buyer_username,
-                order.status,
+                deal.tag,
+                deal.seller_id,
+                deal.seller_username,
+                deal.buyer_username,
+                deal.item_type,
+                deal.item_link,
+                deal.amount,
+                deal.currency,
+                deal.stars_count,
+                deal.status,
             ),
         )
-        conn.commit()
+        connection.commit()
     logger.info(
-        "order_created tag=%s creator_id=%s username=%s role=%s item=%s currency=%s amount=%s recipient=%s",
-        order.tag,
-        order.creator_id,
-        order.creator_username,
-        order.role,
-        order.item_type,
-        order.currency,
-        order.amount,
-        order.recipient,
+        "deal_created tag=%s seller_id=%s seller_username=%s buyer_username=%s item_type=%s item_link=%s amount=%s currency=%s",
+        deal.tag,
+        deal.seller_id,
+        deal.seller_username,
+        deal.buyer_username,
+        deal.item_type,
+        deal.item_link,
+        deal.amount,
+        deal.currency,
     )
-    return order
+    return deal
 
 
-def find_order(tag: str) -> Order | None:
-    with closing(db()) as conn:
-        row = conn.execute("SELECT * FROM orders WHERE tag = ?", (tag,)).fetchone()
+def find_deal(tag: str) -> Deal | None:
+    with closing(db()) as connection:
+        row = connection.execute("SELECT * FROM deals WHERE tag = ?", (tag,)).fetchone()
     if not row:
         return None
-    return Order(
+    return Deal(
         tag=row["tag"],
-        creator_id=row["creator_id"],
-        creator_username=row["creator_username"],
-        role=row["role"],
-        item_type=row["item_type"],
-        currency=row["currency"],
-        recipient=row["recipient"],
-        amount=row["amount"],
-        description=row["description"],
+        seller_id=row["seller_id"],
+        seller_username=row["seller_username"],
         buyer_username=row["buyer_username"],
+        item_type=row["item_type"],
+        item_link=row["item_link"],
+        amount=row["amount"],
+        currency=row["currency"],
+        stars_count=row["stars_count"],
         status=row["status"],
     )
 
 
-def recent_orders(user_id: int, limit: int = 5) -> list[sqlite3.Row]:
-    with closing(db()) as conn:
-        return conn.execute(
-            "SELECT tag, amount, currency, status FROM orders WHERE creator_id = ? ORDER BY created_at DESC LIMIT ?",
-            (user_id, limit),
-        ).fetchall()
-
-
-def pay_order(tag: str, user_id: int, lang: str) -> tuple[bool, str]:
-    order = find_order(tag)
-    if not order:
-        return False, "Order not found." if lang == "en" else "Ордер не найден."
-    if order.status == "paid":
-        return False, "Order is already paid." if lang == "en" else "Ордер уже оплачен."
-    current = get_balance(user_id, order.currency)
-    if current < order.amount:
-        if lang == "en":
-            return False, f"Not enough funds.\n\nRequired: {money(order.amount)} {order.currency}\nAvailable: {money(current)} {order.currency}\n\nBalances:\n{balance_lines(user_id)}"
-        return False, f"Недостаточно средств.\n\nНужно: {money(order.amount)} {order.currency}\nДоступно: {money(current)} {order.currency}\n\nБалансы:\n{balance_lines(user_id)}"
-    add_balance(user_id, -order.amount, order.currency)
-    with closing(db()) as conn:
-        conn.execute("UPDATE orders SET status = 'paid' WHERE tag = ?", (tag,))
-        conn.commit()
-    logger.info("order_paid tag=%s payer_id=%s amount=%s currency=%s", tag, user_id, order.amount, order.currency)
-    return True, f"✅ Order #{tag} paid." if lang == "en" else f"✅ Ордер #{tag} оплачен."
-
-
 def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def is_staff(user_id: int) -> bool:
     return user_id in ADMIN_IDS or user_id in WORKER_IDS
 
 
@@ -329,499 +330,561 @@ def money(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else f"{value:.2f}"
 
 
-def b(text: str, *, callback_data: str | None = None, url: str | None = None, style: str = "primary") -> InlineKeyboardButton:
+def button(text: str, *, callback_data: str | None = None, url: str | None = None, style: str = "primary") -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=callback_data, url=url, style=style)
 
 
-def lang_keyboard() -> InlineKeyboardMarkup:
+def main_menu(lang: str = "ru") -> InlineKeyboardMarkup:
+    if lang == "en":
+        rows = [
+            [button("🆕 Create order", callback_data="deal:create", style="success")],
+            [button("💳 Balance", callback_data="profile"), button("🔔 Security", callback_data="requisites", style="success")],
+            [button("💙 Referrals", callback_data="refs"), button("📦 My deals", callback_data="deals:mine")],
+            [button("💬 Support", url=f"https://t.me/{SUPPORT_USERNAME}"), button("🔵 Language", callback_data="language")],
+        ]
+    else:
+        rows = [
+            [button("🆕 Создать ордер", callback_data="deal:create", style="success")],
+            [button("💳 Баланс", callback_data="profile"), button("🔔 Безопасность", callback_data="requisites", style="success")],
+            [button("💙 Рефералы", callback_data="refs"), button("📦 Мои сделки", callback_data="deals:mine")],
+            [button("💬 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}"), button("🔵 Язык", callback_data="language")],
+        ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def deal_type_keyboard(lang: str = "ru") -> InlineKeyboardMarkup:
+    back = "⬅️ Back" if lang == "en" else "⬅️ Назад"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [button("🖼 NFT Gift", callback_data="dealtype:nft"), button("⭐ Telegram Stars", callback_data="dealtype:stars")],
+            [button("👤 Username", callback_data="dealtype:username"), button("💠 Crypto", callback_data="dealtype:crypto")],
+            [button("👑 Telegram Premium", callback_data="dealtype:premium")],
+            [button(back, callback_data="menu", style="danger")],
+        ]
+    )
+
+
+def currency_keyboard(lang: str = "ru") -> InlineKeyboardMarkup:
+    back = "⬅️ Back" if lang == "en" else "⬅️ Назад"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                b("🇷🇺 Русский", callback_data="lang:ru"),
-                b("🇺🇸 English", callback_data="lang:en"),
-            ]
+                button("⭐ Stars", callback_data="currency:Stars"),
+                button("💎 TON", callback_data="currency:TON"),
+                button("💵 USDT", callback_data="currency:USDT"),
+                button("₽ RUB", callback_data="currency:RUB"),
+            ],
+            [button(back, callback_data="deal:create", style="danger")],
         ]
     )
 
 
-def main_keyboard(lang: str) -> InlineKeyboardMarkup:
-    if lang == "en":
-        rows = [
-            [b("📦 Create order", callback_data="order:create", style="success")],
-            [b("💎 Balance", callback_data="balance:menu"), b("💳 Requisites", callback_data="requisites")],
-            [b("🌐 Language", callback_data="language"), b("🚘 Profile", callback_data="profile")],
-            [b("🪬 Referrals", callback_data="refs"), b("💼 My orders", callback_data="orders:mine")],
-            [b("🔗 Support", url=f"https://t.me/{SUPPORT_USERNAME}", style="danger"), b("🗝 Security", callback_data="security", style="danger")],
-        ]
-    else:
-        rows = [
-            [b("📦 Создать ордер", callback_data="order:create", style="success")],
-            [b("💎 Баланс", callback_data="balance:menu"), b("💳 Реквизиты", callback_data="requisites")],
-            [b("🌐 Язык", callback_data="language"), b("🚘 Профиль", callback_data="profile")],
-            [b("🪬 Рефералы", callback_data="refs"), b("💼 Мои ордеры", callback_data="orders:mine")],
-            [b("🔗 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}", style="danger"), b("🗝 Безопасность", callback_data="security", style="danger")],
-        ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def back_menu_keyboard(lang: str = "ru") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[button("◀️ Menu" if lang == "en" else "◀️ В меню", callback_data="menu")]])
 
 
-def back_keyboard(lang: str, target: str = "menu") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[b("↟ Menu" if lang == "en" else "↟ В меню", callback_data=target)]])
-
-
-def role_keyboard(lang: str) -> InlineKeyboardMarkup:
-    seller = "🎁 I am seller" if lang == "en" else "🎁 Я продавец"
-    buyer = "🎁 I am buyer" if lang == "en" else "🎁 Я покупатель"
-    back = "↟ Back" if lang == "en" else "↟ Назад"
-    return InlineKeyboardMarkup(inline_keyboard=[[b(seller, callback_data="role:seller"), b(buyer, callback_data="role:buyer")], [b(back, callback_data="menu")]])
-
-
-def item_keyboard(lang: str) -> InlineKeyboardMarkup:
-    back = "↟ Back" if lang == "en" else "↟ Назад"
+def language_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [b("▱ NFT-Gift", callback_data="item:nft"), b("▱ NFT-username", callback_data="item:username")],
-            [b("★ Stars", callback_data="item:stars"), b("🔽 TON", callback_data="item:ton")],
-            [b("✈ Telegram Premium", callback_data="item:premium")],
-            [b(back, callback_data="order:create")],
+            [button("🇷🇺 Русский", callback_data="lang:ru"), button("🇬🇧 English", callback_data="lang:en")],
+            [button("◀️ В меню", callback_data="menu")],
         ]
     )
 
 
-def currency_keyboard(lang: str) -> InlineKeyboardMarkup:
-    back = "↟ Back" if lang == "en" else "↟ Назад"
+def buyer_keyboard(deal: Deal, user_id: int, username: str | None, lang: str = "ru") -> InlineKeyboardMarkup | None:
+    allowed_buyer = bool(username and username.lower() == deal.buyer_username.lower())
+    if not allowed_buyer and not is_staff(user_id):
+        return None
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [b("★ Звезды" if lang == "ru" else "★ Stars", callback_data="currency:Stars", style="success"), b("🔽 TON", callback_data="currency:TON")],
-            [b("₽ Карта/СПБ" if lang == "ru" else "₽ Card", callback_data="currency:RUB"), b("₮ USDT (TON)", callback_data="currency:USDT", style="success")],
-            [b(back, callback_data="order:item")],
+            [button("💎 Pay from balance" if lang == "en" else "💎 Оплатить с баланса", callback_data=f"deal:pay:{deal.tag}", style="success")],
+            [button("💬 Support" if lang == "en" else "💬 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}")],
         ]
     )
 
 
-def requisite_keyboard(lang: str) -> InlineKeyboardMarkup:
-    menu = "↟ Menu" if lang == "en" else "↟ В меню"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [b("Ⓢ Bind USDT" if lang == "en" else "Ⓢ Привязать USDT", callback_data="bind:usdt", style="success")],
-            [b("Ⓣ Bind TON" if lang == "en" else "Ⓣ Привязать TON", callback_data="bind:ton")],
-            [b("▭ Bind Card" if lang == "en" else "▭ Привязать Карту/СПБ", callback_data="bind:card", style="success")],
-            [b("★ Bind Username" if lang == "en" else "★ Привязать Username", callback_data="bind:stars_username")],
-            [b(menu, callback_data="menu")],
-        ]
-    )
-
-
-def balance_keyboard(lang: str) -> InlineKeyboardMarkup:
-    if lang == "en":
-        return InlineKeyboardMarkup(inline_keyboard=[[b("💎 Withdraw balance", callback_data="balance:withdraw"), b("💎 Top up balance", callback_data="balance:topup", style="success")], [b("↟ Menu", callback_data="menu")]])
-    return InlineKeyboardMarkup(inline_keyboard=[[b("💎 Вывести баланс", callback_data="balance:withdraw"), b("💎 Пополнить баланс", callback_data="balance:topup", style="success")], [b("↟ В меню", callback_data="menu")]])
-
-
-def balance_currency_keyboard(lang: str, action: str) -> InlineKeyboardMarkup:
-    back = "↟ Back" if lang == "en" else "↟ Назад"
-    rows = [
-        [b("★ Звезды" if lang == "ru" else "★ Stars", callback_data=f"{action}:Stars", style="success"), b("🔽 TON", callback_data=f"{action}:TON")],
-        [b("₽ RUB", callback_data=f"{action}:RUB"), b("₮ USDT (TON)", callback_data=f"{action}:USDT", style="success")],
-        [b("₴ UAH", callback_data=f"{action}:UAH"), b("◼ USD", callback_data=f"{action}:USD"), b("💰 BYN", callback_data=f"{action}:BYN")],
-        [b(back, callback_data="balance:menu")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def order_pay_keyboard(order: Order, lang: str) -> InlineKeyboardMarkup:
-    if lang == "en":
-        rows = [[b("💎 Pay order", callback_data=f"pay:{order.tag}", style="success")], [b("🔗 Support", url=f"https://t.me/{SUPPORT_USERNAME}")]]
-    else:
-        rows = [[b("💎 Оплатить ордер", callback_data=f"pay:{order.tag}", style="success")], [b("🔗 Тех. Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}")]]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def order_created_keyboard(order: Order, lang: str) -> InlineKeyboardMarkup:
-    share_text = f"https://t.me/{BOT_USERNAME}?start=order_{order.tag}" if BOT_USERNAME else ""
-    support = "🔗 Tech support" if lang == "en" else "🔗 Тех. Поддержка"
-    cancel = "‼ Cancel order" if lang == "en" else "‼ Отменить ордер"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [b("☚ Share order" if lang == "en" else "☚ Поделиться ордером", url=f"https://t.me/share/url?url={share_text}")],
-            [b(support, url=f"https://t.me/{SUPPORT_USERNAME}")],
-            [b(cancel, callback_data=f"cancel:{order.tag}", style="danger")],
-        ]
-    )
-
-
-def welcome_caption(lang: str) -> str:
+def welcome_text(lang: str = "ru") -> str:
     if lang == "en":
         return (
-            "👋 <b>Welcome!</b>\n\n"
-            "<blockquote>🛡 Kasper is a specialized service for secure off-exchange deals.\n"
-            "web3 Automated execution algorithm. Fast withdrawals.</blockquote>\n\n"
-            "<blockquote>① Automatic deals with NFT and gifts.</blockquote>\n"
-            "<blockquote>② Full protection for both sides.</blockquote>\n"
-            "<blockquote>③ Funds are frozen until confirmation.</blockquote>\n"
-            f"<blockquote>④ Transfer through manager: @{SUPPORT_USERNAME}</blockquote>\n\n"
-            "<blockquote>Choose an action below ◇</blockquote>"
+            "Welcome to <b>Kasper</b> 👋\n\n"
+            "💎 <b>Kasper</b> is a specialized service for secure deals with NFT gifts, Stars and Telegram assets.\n\n"
+            "<pre>"
+            "🟣 Automated order execution.\n"
+            "🔵 Fast deal creation and verification.\n"
+            "💎 Payment from Kasper internal balance."
+            "</pre>\n\n"
+            "<pre>"
+            "• Service fee: 1%\n"
+            "• Working mode: 24/7\n"
+            f"• Support: @{SUPPORT_USERNAME}"
+            "</pre>\n\n"
+            "🛡 <b>Choose a section below:</b>"
         )
     return (
-        "👋 <b>Добро пожаловать!</b>\n\n"
-        "<blockquote>🛡 Kasper — специализированный сервис по обеспечению безопасности внебиржевых сделок.\n"
-        "web3 Автоматизированный алгоритм исполнения. Удобный и быстрый вывод средств</blockquote>\n\n"
-        "<blockquote>① Автоматические сделки с NFT и подарками.</blockquote>\n"
-        "<blockquote>② Полная защита обеих сторон.</blockquote>\n"
-        "<blockquote>③ Средства заморожены до подтверждения.</blockquote>\n"
-        f"<blockquote>④ Передача через менеджера: @{SUPPORT_USERNAME}</blockquote>\n\n"
-        "<blockquote>Выберите действие ниже ◇</blockquote>"
+        "Добро пожаловать в <b>Kasper</b> 👋\n\n"
+        "💎 <b>Kasper</b> — специализированный сервис для безопасных сделок с NFT-подарками, Stars и Telegram-активами.\n\n"
+        "<pre>"
+        "🟣 Автоматизированное исполнение ордеров.\n"
+        "🔵 Быстрое создание и проверка сделки.\n"
+        "💎 Оплата с внутреннего баланса Kasper."
+        "</pre>\n\n"
+        "<pre>"
+        "• Комиссия сервиса: 1%\n"
+        "• Режим работы: 24/7\n"
+        f"• Поддержка: @{SUPPORT_USERNAME}"
+        "</pre>\n\n"
+        "🛡 <b>Выберите нужный раздел ниже:</b>"
     )
 
 
-async def send_language(message: Message) -> None:
-    await message.answer("<b>Kasper</b>\n\nВыберите язык / Choose language", reply_markup=lang_keyboard(), parse_mode=ParseMode.HTML)
+async def send_menu(message: Message) -> None:
+    lang = get_user_lang(message.from_user.id if message.from_user else None)
+    image_path = Path("kasper.jpg")
+    if image_path.exists():
+        await message.answer_photo(
+            photo=FSInputFile(image_path),
+            caption=welcome_text(lang),
+            reply_markup=main_menu(lang),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await message.answer(welcome_text(lang), reply_markup=main_menu(lang), parse_mode=ParseMode.HTML)
 
 
-async def send_menu(message: Message, lang: str) -> None:
-    image = Path("kasper.jpg")
-    if image.exists():
-        await message.answer_photo(FSInputFile(image), caption=welcome_caption(lang), reply_markup=main_keyboard(lang), parse_mode=ParseMode.HTML)
-    else:
-        await message.answer(welcome_caption(lang), reply_markup=main_keyboard(lang), parse_mode=ParseMode.HTML)
+async def handle_admin_command_in_state(message: Message, state: FSMContext) -> bool:
+    text = (message.text or "").strip()
+    if not text.startswith("/"):
+        return False
+
+    parts = text.split()
+    command = parts[0].split("@", 1)[0].lower()
+
+    if command == "/start":
+        await state.clear()
+        await send_menu(message)
+        return True
+
+    user = message.from_user
+    if not user or not is_admin(user.id):
+        await state.clear()
+        await message.answer("Команда сброшена. Нажмите /start.")
+        return True
+
+    await state.clear()
+
+    if command == "/admin":
+        await send_admin_help(message)
+        return True
+    if command == "/addbalance":
+        await add_balance_from_parts(message, parts[1:])
+        return True
+    if command == "/balance":
+        await show_balance_from_parts(message, parts[1:])
+        return True
+    if command == "/setpaylink":
+        await set_paylink_from_parts(message, parts[1:])
+        return True
+
+    await message.answer("Неизвестная команда. Нажмите /admin.")
+    return True
 
 
 @router.message(Command("start"))
 async def start(message: Message, command: CommandObject) -> None:
-    remember_user(message.from_user)
+    remember_user(message)
     args = command.args or ""
-    lang = get_lang(message.from_user.id if message.from_user else None)
-    if args.startswith("order_"):
-        await show_order(message, args.removeprefix("order_"))
+    if args.startswith("deal_"):
+        await show_deal(message, args.removeprefix("deal_"))
         return
-    if not command.args:
-        await send_language(message)
-        return
-    await send_menu(message, lang)
-
-
-@router.callback_query(F.data.startswith("lang:"))
-async def choose_language(callback: CallbackQuery) -> None:
-    remember_user(callback.from_user)
-    lang = callback.data.split(":", 1)[1]
-    set_lang(callback.from_user.id, lang)
-    await callback.answer("Language saved" if lang == "en" else "Язык сохранен")
-    await send_menu(callback.message, lang)
-
-
-@router.callback_query(F.data == "language")
-async def language(callback: CallbackQuery) -> None:
-    await callback.answer()
-    await callback.message.answer("Выберите язык / Choose language", reply_markup=lang_keyboard())
+    await send_menu(message)
 
 
 @router.callback_query(F.data == "menu")
-async def menu(callback: CallbackQuery, state: FSMContext) -> None:
+async def menu_callback(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.clear()
-    await send_menu(callback.message, get_lang(callback.from_user.id))
+    lang = get_user_lang(callback.from_user.id)
+    await callback.message.answer(welcome_text(lang), reply_markup=main_menu(lang), parse_mode=ParseMode.HTML)
 
 
-@router.callback_query(F.data == "order:create")
-async def order_create(callback: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(F.data == "deal:create")
+async def create_deal(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
-    lang = get_lang(callback.from_user.id)
+    lang = get_user_lang(callback.from_user.id)
+    await state.set_state(DealState.choosing_type)
+    text = "💠 <b>Choose deal format</b>" if lang == "en" else "💠 <b>Выберите формат сделки</b>"
+    await callback.message.answer(text, reply_markup=deal_type_keyboard(lang), parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("dealtype:"))
+async def choose_type(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    lang = get_user_lang(callback.from_user.id)
+    item_type = callback.data.split(":", 1)[1]
     await state.clear()
-    await state.set_state(OrderState.choosing_role)
-    title = "Order creation" if lang == "en" else "Создание ордера"
-    text = "Choose your role in the deal:" if lang == "en" else "Выберите, кто вы в сделке:"
-    await callback.message.answer(f"<b>{title}</b>\n\n{text}", reply_markup=role_keyboard(lang), parse_mode=ParseMode.HTML)
+    await state.update_data(item_type=item_type)
+    if item_type == "stars":
+        await state.set_state(DealState.waiting_stars_count)
+        text = "⭐ <b>Enter Stars amount</b>\n\nExample: <code>500</code>" if lang == "en" else "⭐ <b>Введите количество Stars</b>\n\nПример: <code>500</code>"
+        await callback.message.answer(text, parse_mode=ParseMode.HTML)
+    else:
+        await state.set_state(DealState.waiting_link)
+        text = "🔗 <b>Send item link</b>\n\nExample: <code>https://t.me/nft/example</code>" if lang == "en" else "🔗 <b>Вставьте ссылку на товар</b>\n\nПример: <code>https://t.me/nft/example</code>"
+        await callback.message.answer(text, parse_mode=ParseMode.HTML)
 
 
-@router.callback_query(F.data.startswith("role:"))
-async def role_selected(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    lang = get_lang(callback.from_user.id)
-    await state.update_data(role=callback.data.split(":", 1)[1])
-    await state.set_state(OrderState.choosing_item)
-    await callback.message.answer(
-        ("<b>What is the order about?</b>\n\nChoose item or service:" if lang == "en" else "<b>В чем заключается ордер?</b>\n\nВыберите товар или услугу:"),
-        reply_markup=item_keyboard(lang),
-        parse_mode=ParseMode.HTML,
-    )
+@router.message(DealState.waiting_stars_count)
+async def stars_count(message: Message, state: FSMContext) -> None:
+    if await handle_admin_command_in_state(message, state):
+        return
+    lang = get_user_lang(message.from_user.id if message.from_user else None)
+    if not message.text or not message.text.isdigit():
+        text = "Enter a number, for example: <code>500</code>" if lang == "en" else "Введите число, например: <code>500</code>"
+        await message.answer(text, parse_mode=ParseMode.HTML)
+        return
+    await state.update_data(stars_count=int(message.text), item_link="Telegram Stars")
+    await state.set_state(DealState.waiting_link)
+    text = "🔗 <b>Send item link</b>\n\nExample: <code>https://t.me/nft/example</code>" if lang == "en" else "🔗 <b>Вставьте ссылку на товар</b>\n\nПример: <code>https://t.me/nft/example</code>"
+    await message.answer(text, parse_mode=ParseMode.HTML)
 
 
-@router.callback_query(F.data == "order:item")
-async def order_item_back(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    lang = get_lang(callback.from_user.id)
-    await state.set_state(OrderState.choosing_item)
-    await callback.message.answer(
-        ("<b>What is the order about?</b>\n\nChoose item or service:" if lang == "en" else "<b>В чем заключается ордер?</b>\n\nВыберите товар или услугу:"),
-        reply_markup=item_keyboard(lang),
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@router.callback_query(F.data.startswith("item:"))
-async def item_selected(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    lang = get_lang(callback.from_user.id)
-    await state.update_data(item_type=callback.data.split(":", 1)[1])
-    await state.set_state(OrderState.choosing_currency)
-    await callback.message.answer(
-        ("<b>Choose payment currency</b>\n\nAfter choosing currency, specify recipient and amount." if lang == "en" else "<b>Выберите валюту оплаты</b>\n\nПосле выбора валюты укажите получателя и сумму."),
-        reply_markup=currency_keyboard(lang),
-        parse_mode=ParseMode.HTML,
-    )
+@router.message(DealState.waiting_link)
+async def item_link(message: Message, state: FSMContext) -> None:
+    if await handle_admin_command_in_state(message, state):
+        return
+    lang = get_user_lang(message.from_user.id if message.from_user else None)
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    if text.startswith("@") and {"item_link", "currency", "amount"}.issubset(data):
+        await finish_deal(message, state, text)
+        return
+    if not message.text or not message.text.startswith(("https://t.me/", "http://t.me/")):
+        prompt = "Send a Telegram link, for example: <code>https://t.me/nft/example</code>" if lang == "en" else "Нужна ссылка Telegram, например: <code>https://t.me/nft/example</code>"
+        await message.answer(prompt, parse_mode=ParseMode.HTML)
+        return
+    await state.update_data(item_link=text)
+    await state.set_state(DealState.choosing_currency)
+    prompt = "💎 <b>Choose payment currency</b>" if lang == "en" else "💎 <b>Выберите валюту оплаты</b>"
+    await message.answer(prompt, reply_markup=currency_keyboard(lang), parse_mode=ParseMode.HTML)
 
 
 @router.callback_query(F.data.startswith("currency:"))
-async def currency_selected(callback: CallbackQuery, state: FSMContext) -> None:
+async def choose_currency(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
-    lang = get_lang(callback.from_user.id)
+    lang = get_user_lang(callback.from_user.id)
+    data = await state.get_data()
+    if "item_link" not in data:
+        await state.set_state(DealState.choosing_type)
+        text = "This old button has no deal data anymore. Choose the deal type again." if lang == "en" else "Эта старая кнопка уже без данных сделки. Выберите тип сделки заново."
+        await callback.message.answer(text, reply_markup=deal_type_keyboard(lang))
+        return
     currency = callback.data.split(":", 1)[1]
-    missing = missing_requisite(callback.from_user.id, currency)
-    if missing:
-        field, label = missing
-        await state.update_data(pending_bind_field=field)
-        if lang == "en":
-            text = f"<b>You have no {label} linked</b>\n\nFor an order in {currency}, add receiving details.\n\nBind requisites and create the order again."
-        else:
-            text = f"<b>У вас не привязан {label}</b>\n\nДля ордера в {currency} нужно указать аккаунт получения.\n\nПривяжите реквизиты и повторите создание ордера."
-        await callback.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[b("Реквизиты" if lang == "ru" else "Requisites", callback_data="requisites")], [b("↟ Назад" if lang == "ru" else "↟ Back", callback_data="order:create")]]), parse_mode=ParseMode.HTML)
-        return
     await state.update_data(currency=currency)
-    await state.set_state(OrderState.waiting_recipient)
-    await callback.message.answer(
-        ("<b>NFT-Gift recipient</b>\n\nEnter recipient username" if lang == "en" else "<b>Получатель NFT-Gift</b>\n\nУкажите username получателя"),
-        reply_markup=back_keyboard(lang),
-        parse_mode=ParseMode.HTML,
-    )
+    await state.set_state(DealState.waiting_amount)
+    text = f"💰 <b>Enter amount in {currency}</b>\n\nExample: <code>100</code>" if lang == "en" else f"💰 <b>Введите сумму в {currency}</b>\n\nПример: <code>100</code>"
+    await callback.message.answer(text, parse_mode=ParseMode.HTML)
 
 
-@router.message(OrderState.waiting_recipient)
-async def recipient_entered(message: Message, state: FSMContext) -> None:
-    lang = get_lang(message.from_user.id)
-    text = (message.text or "").strip()
-    if not text.startswith("@"):
-        await message.answer("Enter username like @username" if lang == "en" else "Укажите username в формате @username")
+@router.message(DealState.waiting_amount)
+async def amount(message: Message, state: FSMContext) -> None:
+    if await handle_admin_command_in_state(message, state):
         return
-    await state.update_data(recipient=text)
-    data = await state.get_data()
-    await state.set_state(OrderState.waiting_amount)
-    min_line = "\n\n<blockquote>★ Minimum: 100 Stars</blockquote>" if data.get("currency") == "Stars" and lang == "en" else ""
-    if data.get("currency") == "Stars" and lang == "ru":
-        min_line = "\n\n<blockquote>★ Минимум: 100 звезд</blockquote>"
-    await message.answer(
-        (f"<b>Enter order price</b>{min_line}" if lang == "en" else f"<b>Укажите цену ордера</b>{min_line}"),
-        reply_markup=back_keyboard(lang),
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@router.message(OrderState.waiting_amount)
-async def amount_entered(message: Message, state: FSMContext) -> None:
-    lang = get_lang(message.from_user.id)
+    lang = get_user_lang(message.from_user.id if message.from_user else None)
     try:
-        amount = float((message.text or "").replace(",", "."))
+        value = float((message.text or "").replace(",", "."))
     except ValueError:
-        await message.answer("Enter amount as a number." if lang == "en" else "Введите сумму числом.")
+        text = "Enter a numeric amount, for example: <code>1000</code>" if lang == "en" else "Введите сумму числом, например: <code>1000</code>"
+        await message.answer(text, parse_mode=ParseMode.HTML)
         return
-    data = await state.get_data()
-    if data.get("currency") == "Stars" and amount < 100:
-        await message.answer("Minimum: 100 Stars" if lang == "en" else "Минимум: 100 звезд")
-        return
-    if amount <= 0:
+    if value <= 0:
         await message.answer("Amount must be greater than zero." if lang == "en" else "Сумма должна быть больше нуля.")
         return
-    await state.update_data(amount=amount)
-    await state.set_state(OrderState.waiting_description)
+    await state.update_data(amount=value)
+    await state.set_state(DealState.waiting_buyer)
+    text = "👤 <b>Enter buyer username</b>\n\nExample: <code>@username</code>" if lang == "en" else "👤 <b>Укажите username покупателя</b>\n\nПример: <code>@username</code>"
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+
+@router.message(DealState.waiting_buyer)
+async def buyer(message: Message, state: FSMContext) -> None:
+    if await handle_admin_command_in_state(message, state):
+        return
+    lang = get_user_lang(message.from_user.id if message.from_user else None)
+    text = (message.text or "").strip()
+    if not text.startswith("@") or len(text) < 3:
+        prompt = "Enter username in <code>@username</code> format." if lang == "en" else "Укажите username в формате <code>@username</code>."
+        await message.answer(prompt, parse_mode=ParseMode.HTML)
+        return
+    await finish_deal(message, state, text)
+
+
+async def finish_deal(message: Message, state: FSMContext, buyer_username: str) -> None:
+    lang = get_user_lang(message.from_user.id if message.from_user else None)
+    data = await state.get_data()
+    data["buyer_username"] = buyer_username
+    seller = message.from_user
+    deal = save_deal(data, seller.id, seller.username or str(seller.id))
+    await state.clear()
+    link = f"https://t.me/{BOT_USERNAME}?start=deal_{deal.tag}" if BOT_USERNAME else f"/start deal_{deal.tag}"
+    if lang == "en":
+        text = (
+            "✅ <b>Deal #{} created</b>\n\n"
+            "💎 Amount: <b>{} {}</b>\n"
+            "📦 Item: {}\n"
+            "👤 Buyer: @{}\n\n"
+            "🔗 <b>Payment link:</b>\n"
+            "<code>{}</code>\n\n"
+            "🧾 Deal tag: <b>#{}</b>"
+        )
+    else:
+        text = (
+            "✅ <b>Сделка #{} создана</b>\n\n"
+            "💎 Сумма: <b>{} {}</b>\n"
+            "📦 Товар: {}\n"
+            "👤 Покупатель: @{}\n\n"
+            "🔗 <b>Ссылка для оплаты:</b>\n"
+            "<code>{}</code>\n\n"
+            "🧾 Тег сделки: <b>#{}</b>"
+        )
     await message.answer(
-        ("<b>Enter description or link</b>\n\nExample: https://t.me/nft/example" if lang == "en" else "<b>Укажите описание или ссылку</b>\n\nПример: https://t.me/nft/example"),
-        reply_markup=back_keyboard(lang),
+        text.format(deal.tag, money(deal.amount), deal.currency, deal.item_link, deal.buyer_username, link, deal.tag),
         parse_mode=ParseMode.HTML,
     )
 
 
-@router.message(OrderState.waiting_description)
-async def description_entered(message: Message, state: FSMContext) -> None:
-    lang = get_lang(message.from_user.id)
-    data = await state.get_data()
-    data["description"] = (message.text or "").strip()
-    order = save_order(data, message.from_user)
-    await state.clear()
-    link = f"https://t.me/{BOT_USERNAME}?start=order_{order.tag}" if BOT_USERNAME else f"/start order_{order.tag}"
-    if lang == "en":
-        text = (
-            f"🔗 order created: <code>{order.tag}</code>\n\n"
-            f"Username buyer: {order.recipient}\n"
-            f"Amount: <b>{money(order.amount)} {order.currency}</b>\n"
-            f"Description: {order.description}\n\n"
-            f"🔗 Link for buyer:\n\n{link}\n\n"
-            f"<blockquote>◎ Important: gift transfer is performed through manager @{SUPPORT_USERNAME}\n"
-            "Always check the order tag!</blockquote>"
-        )
-    else:
-        text = (
-            f"🔗 ордер создан: <code>{order.tag}</code>\n\n"
-            f"Username покупателя: {order.recipient}\n"
-            f"Сумма: <b>{money(order.amount)} {order.currency}</b>\n"
-            f"Описание: {order.description}\n\n"
-            f"🔗 Ссылка для покупателя:\n\n{link}\n\n"
-            f"<blockquote>◎ Важно: передача подарка выполняется через менеджера @{SUPPORT_USERNAME}\n"
-            "Обязательно сверяйте тег ордера!</blockquote>"
-        )
-    await message.answer(text, reply_markup=order_created_keyboard(order, lang), parse_mode=ParseMode.HTML)
-
-
-async def show_order(message: Message, tag: str) -> None:
-    lang = get_lang(message.from_user.id if message.from_user else None)
-    order = find_order(tag)
-    if not order:
-        await message.answer("Order not found." if lang == "en" else "Ордер не найден.")
+async def show_deal(message: Message, tag: str) -> None:
+    lang = get_user_lang(message.from_user.id if message.from_user else None)
+    deal = find_deal(tag)
+    if not deal:
+        await message.answer("Deal not found." if lang == "en" else "Сделка не найдена.")
         return
+    user_id = message.from_user.id if message.from_user else 0
+    username = message.from_user.username if message.from_user else None
+    keyboard = buyer_keyboard(deal, user_id, username, lang)
     if lang == "en":
-        text = f"<b>Order #{order.tag}</b>\n\nItem: {order.item_type}\nAmount: <b>{money(order.amount)} {order.currency}</b>\nSeller: @{order.creator_username}\nBuyer: @{order.buyer_username}\n\nPayment is made from your Kasper balance."
+        text = (
+            f"🛡 <b>Kasper Deal #{deal.tag}</b>\n\n"
+            f"📦 Item: {DEAL_TYPES.get(deal.item_type, deal.item_type)}\n"
+            f"🔗 Link: {deal.item_link}\n"
+            f"💎 Amount: <b>{money(deal.amount)} {deal.currency}</b>\n"
+            f"👤 Seller: @{deal.seller_username}\n"
+            f"👤 Buyer: @{deal.buyer_username}\n\n"
+        )
+        text += "Payment is made from your internal Kasper balance." if keyboard else "This deal is assigned to another buyer. Payment button is hidden."
     else:
-        text = f"<b>Ордер #{order.tag}</b>\n\nТовар: {order.item_type}\nСумма: <b>{money(order.amount)} {order.currency}</b>\nПродавец: @{order.creator_username}\nПокупатель: @{order.buyer_username}\n\nОплата выполняется с баланса Kasper."
-    await message.answer(text, reply_markup=order_pay_keyboard(order, lang), parse_mode=ParseMode.HTML)
+        text = (
+            f"🛡 <b>Kasper Deal #{deal.tag}</b>\n\n"
+            f"📦 Товар: {DEAL_TYPES.get(deal.item_type, deal.item_type)}\n"
+            f"🔗 Ссылка: {deal.item_link}\n"
+            f"💎 Сумма: <b>{money(deal.amount)} {deal.currency}</b>\n"
+            f"👤 Продавец: @{deal.seller_username}\n"
+            f"👤 Покупатель: @{deal.buyer_username}\n\n"
+        )
+        text += "Оплата выполняется с внутреннего баланса Kasper." if keyboard else "Эта сделка предназначена другому покупателю. Кнопка оплаты скрыта."
+    await message.answer(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
 
 
-@router.callback_query(F.data.startswith("pay:"))
-async def pay(callback: CallbackQuery) -> None:
-    lang = get_lang(callback.from_user.id)
-    tag = callback.data.split(":", 1)[1]
-    ok, result = pay_order(tag, callback.from_user.id, lang)
+@router.callback_query(F.data.startswith("deal:pay:"))
+async def pay_deal(callback: CallbackQuery) -> None:
+    tag = callback.data.rsplit(":", 1)[1]
+    lang = get_user_lang(callback.from_user.id)
+    deal = find_deal(tag)
+    if not deal:
+        await callback.answer("Deal not found." if lang == "en" else "Сделка не найдена.", show_alert=True)
+        return
+
+    user = callback.from_user
+    username = user.username or ""
+    allowed_buyer = username.lower() == deal.buyer_username.lower()
+    if not allowed_buyer and not is_staff(user.id):
+        logger.warning("deal_pay_denied tag=%s user_id=%s username=%s expected_buyer=%s", tag, user.id, username, deal.buyer_username)
+        await callback.answer("This deal is assigned to another buyer." if lang == "en" else "Эта сделка предназначена другому покупателю.", show_alert=True)
+        return
+
+    ok, result = pay_deal_from_balance(tag, user.id, lang)
+    logger.info(
+        "deal_pay_attempt tag=%s ok=%s payer_id=%s payer_username=%s seller_id=%s buyer_username=%s amount=%s currency=%s result=%s",
+        tag,
+        ok,
+        user.id,
+        username,
+        deal.seller_id,
+        deal.buyer_username,
+        deal.amount,
+        deal.currency,
+        result.replace("\n", " "),
+    )
     await callback.answer(result, show_alert=True)
     if ok:
-        await callback.message.answer(result)
-
-
-@router.callback_query(F.data == "requisites")
-async def requisites(callback: CallbackQuery) -> None:
-    await callback.answer()
-    lang = get_lang(callback.from_user.id)
-    req = get_requisites(callback.from_user.id)
-    if lang == "en":
-        text = (
-            "💳 <b>Your current requisites:</b>\n\n"
-            f"₮ <b>USDT (TON):</b>\n{req['usdt'] or 'not specified'}\n\n"
-            f"🔽 <b>TON:</b>\n{req['ton'] or 'not specified'}\n\n"
-            f"₽ <b>Card:</b>\n{req['card'] or 'not specified'}\n\n"
-            f"★ <b>Stars username:</b>\n{req['stars_username'] or 'not specified'}\n\n"
-            "🔗 Send requisites:\nChoose what you want to bind."
-        )
-    else:
-        text = (
-            "💳 <b>Ваши текущие реквизиты:</b>\n\n"
-            f"₮ <b>USDT (TON):</b>\n{req['usdt'] or 'не указана'}\n\n"
-            f"🔽 <b>TON:</b>\n{req['ton'] or 'не указана'}\n\n"
-            f"₽ <b>Карта/СПБ:</b>\n{req['card'] or 'не указана'}\n\n"
-            f"★ <b>Username для звезд:</b>\n{req['stars_username'] or 'не указана'}\n\n"
-            "🔗 <b>Отправьте реквизиты:</b>\n<i>Выберите, что хотите привязать.</i>"
-        )
-    await callback.message.answer(text, reply_markup=requisite_keyboard(lang), parse_mode=ParseMode.HTML)
-
-
-@router.callback_query(F.data.startswith("bind:"))
-async def bind_start(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    lang = get_lang(callback.from_user.id)
-    field = callback.data.split(":", 1)[1]
-    await state.update_data(bind_field=field)
-    await state.set_state(OrderState.binding_requisite)
-    names = {"usdt": "USDT (TON)", "ton": "TON", "card": "Карта/СПБ", "stars_username": "Stars username"}
-    await callback.message.answer(
-        (f"Send {names[field]} requisites:" if lang == "en" else f"Отправьте реквизит {names[field]}:"),
-        reply_markup=back_keyboard(lang),
-    )
-
-
-@router.message(OrderState.binding_requisite)
-async def bind_save(message: Message, state: FSMContext) -> None:
-    lang = get_lang(message.from_user.id)
-    data = await state.get_data()
-    field = data.get("bind_field")
-    set_requisite(message.from_user.id, field, (message.text or "").strip())
-    await state.clear()
-    await message.answer("✅ Saved." if lang == "en" else "✅ Сохранено.")
-    await requisites(type("Cb", (), {"answer": lambda *a, **k: asyncio.sleep(0), "from_user": message.from_user, "message": message})())
-
-
-@router.callback_query(F.data == "balance:menu")
-async def balance_menu(callback: CallbackQuery) -> None:
-    await callback.answer()
-    lang = get_lang(callback.from_user.id)
-    await callback.message.answer(
-        "Choose balance action" if lang == "en" else "Выберите подходящий вариант использования",
-        reply_markup=balance_keyboard(lang),
-    )
-
-
-@router.callback_query(F.data.in_({"balance:topup", "balance:withdraw"}))
-async def balance_action(callback: CallbackQuery) -> None:
-    await callback.answer()
-    lang = get_lang(callback.from_user.id)
-    action = "topup" if callback.data.endswith("topup") else "withdraw"
-    text = "Choose currency to top up balance" if lang == "en" and action == "topup" else "Choose currency to withdraw balance" if lang == "en" else "Выберите валюту для пополнения баланса" if action == "topup" else "Выберите валюту для вывода баланса"
-    await callback.message.answer(text, reply_markup=balance_currency_keyboard(lang, action))
-
-
-@router.callback_query(F.data.startswith(("topup:", "withdraw:")))
-async def balance_currency_chosen(callback: CallbackQuery) -> None:
-    await callback.answer("Soon")
-    lang = get_lang(callback.from_user.id)
-    await callback.message.answer("Скоро будет доступно. Обратитесь в поддержку." if lang == "ru" else "Coming soon. Contact support.", reply_markup=back_keyboard(lang))
+        if lang == "en":
+            buyer_text = f"{result}\n\n💰 Debited: <b>{money(deal.amount)} {deal.currency}</b>\n📦 Deal: <b>#{deal.tag}</b>"
+        else:
+            buyer_text = f"{result}\n\n💰 Списано: <b>{money(deal.amount)} {deal.currency}</b>\n📦 Сделка: <b>#{deal.tag}</b>"
+        await callback.message.answer(buyer_text, parse_mode=ParseMode.HTML)
+        seller_lang = get_user_lang(deal.seller_id)
+        if seller_lang == "en":
+            seller_text = (
+                f"✅ <b>Deal #{deal.tag} paid!</b>\n"
+                f"Transfer the item to manager @{SUPPORT_USERNAME}.\n"
+                "After transfer, wait 3-7 minutes for withdrawal.\n"
+                "<b>Always verify the manager username!</b>"
+            )
+        else:
+            seller_text = (
+                f"✅ <b>Сделка #{deal.tag} оплачена!</b>\n"
+                f"Передайте товар менеджеру @{SUPPORT_USERNAME}.\n"
+                "После передачи ожидайте вывод средств в течение 3-7 минут.\n"
+                "<b>Сверяйте username менеджера!</b>"
+            )
+        await callback.bot.send_message(deal.seller_id, seller_text, parse_mode=ParseMode.HTML)
 
 
 @router.callback_query(F.data == "profile")
 async def profile(callback: CallbackQuery) -> None:
     await callback.answer()
-    lang = get_lang(callback.from_user.id)
-    req = get_requisites(callback.from_user.id)
-    filled = any(req[key] for key in ["usdt", "ton", "card", "stars_username"])
     user = callback.from_user
+    lang = get_user_lang(user.id)
     if lang == "en":
-        text = f"🚘 <b>Profile</b>\n\nUsername: @{user.username or 'none'}\n\nID: <code>{user.id}</code>\n\nRating: 0.0\n\nSuccessful orders: 0\n\nRequisites: {'filled' if filled else 'not filled'}"
+        text = f"💎 <b>Kasper Balance</b>\n\nID: <code>{user.id}</code>\nUsername: @{user.username or 'none'}\n\n<b>Balances:</b>\n{balance_lines(user.id)}"
     else:
-        text = f"🚘 <b>Профиль</b>\n\nUsername: @{user.username or 'нет'}\n\nID: <code>{user.id}</code>\n\nРейтинг: 0.0\n\nУспешных ордеров: 0\n\nРеквизиты: {'заполнены' if filled else 'не заполнены'}"
-    await callback.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[b("☎ Check balance" if lang == "en" else "☎ Проверить баланс", callback_data="balance:menu", style="success")], [b("↟ Menu" if lang == "en" else "↟ В меню", callback_data="menu")]]), parse_mode=ParseMode.HTML)
+        text = f"💎 <b>Баланс Kasper</b>\n\nID: <code>{user.id}</code>\nUsername: @{user.username or 'нет'}\n\n<b>Балансы:</b>\n{balance_lines(user.id)}"
+    await callback.message.answer(text, parse_mode=ParseMode.HTML)
 
 
-@router.callback_query(F.data == "orders:mine")
-async def my_orders(callback: CallbackQuery) -> None:
+@router.callback_query(F.data == "language")
+async def language(callback: CallbackQuery) -> None:
     await callback.answer()
-    lang = get_lang(callback.from_user.id)
-    rows = recent_orders(callback.from_user.id)
-    if not rows:
-        text = "No orders yet." if lang == "en" else "Ордеров пока нет."
-    else:
-        head = "Last 5 orders:" if lang == "en" else "Последние 5 ордеров:"
-        lines = [head, ""]
-        for idx, row in enumerate(rows, 1):
-            lines.append(f"{idx}  #{row['tag']} — {money(float(row['amount']))} {row['currency']}")
-        text = "\n".join(lines)
-    await callback.message.answer(text, reply_markup=back_keyboard(lang))
+    lang = get_user_lang(callback.from_user.id)
+    title = "🌐 <b>Choose interface language</b>" if lang == "en" else "🌐 <b>Выберите язык интерфейса</b>"
+    await callback.message.answer(
+        title + "\n\n<blockquote>🇷🇺 Русский\n🇬🇧 English</blockquote>",
+        reply_markup=language_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
 
 
-@router.callback_query(F.data == "security")
+@router.callback_query(F.data.startswith("lang:"))
+async def set_language(callback: CallbackQuery) -> None:
+    lang = "ru" if callback.data.endswith(":ru") else "en"
+    set_user_lang(callback.from_user.id, lang)
+    await callback.answer("Language saved" if lang == "en" else "Язык сохранён")
+    language_name = "Русский" if lang == "ru" else "English"
+    text = f"✅ Selected language: <b>{language_name}</b>" if lang == "en" else f"✅ Выбран язык: <b>{language_name}</b>"
+    await callback.message.answer(text, reply_markup=back_menu_keyboard(lang), parse_mode=ParseMode.HTML)
+    await callback.message.answer(welcome_text(lang), reply_markup=main_menu(lang), parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data == "requisites")
 async def security(callback: CallbackQuery) -> None:
     await callback.answer()
-    lang = get_lang(callback.from_user.id)
+    lang = get_user_lang(callback.from_user.id)
     if lang == "en":
-        text = f"🗝 <b>Security</b>\n\n① Transfer goods only to manager:\n@{SUPPORT_USERNAME}\n\n② Do not send goods directly to buyer.\nTransfer goes through the service.\n\n③ Check amount and order tag in payment comment.\n\n④ After verification, buyer confirms receipt and order closes."
+        text = (
+            "🛡 <b>Security rules</b>\n\n"
+            f"<blockquote>• Transfer the gift only to manager @{SUPPORT_USERNAME}</blockquote>\n\n"
+            "<blockquote>• Do not send directly to the buyer — transfer goes through the service</blockquote>\n\n"
+            "<blockquote>• Check the amount and order tag in the payment comment</blockquote>\n\n"
+            "<blockquote>• After verification, the buyer confirms receipt and the order is closed</blockquote>"
+        )
     else:
-        text = f"🗝 <b>Безопасность</b>\n\n① Передавайте товар только менеджеру:\n@{SUPPORT_USERNAME}\n\n② Не отправляйте товар напрямую покупателю.\nПередача идет через сервис.\n\n③ Сверяйте сумму и тег ордера в комментарии к платежу.\n\n④ После проверки покупатель подтверждает получение и ордер закрывается."
-    await callback.message.answer(text, reply_markup=back_keyboard(lang), parse_mode=ParseMode.HTML)
+        text = (
+            "🛡 <b>Правила безопасности</b>\n\n"
+            f"<blockquote>• Передавайте подарок только менеджеру @{SUPPORT_USERNAME}</blockquote>\n\n"
+            "<blockquote>• Не отправляйте напрямую покупателю — передача идёт через сервис</blockquote>\n\n"
+            "<blockquote>• Сверяйте сумму и тег ордера в комментарии к платежу</blockquote>\n\n"
+            "<blockquote>• После проверки покупатель подтверждает получение и ордер закрывается</blockquote>"
+        )
+    await callback.message.answer(text, reply_markup=back_menu_keyboard(lang), parse_mode=ParseMode.HTML)
 
 
-@router.callback_query(F.data == "refs")
-async def refs(callback: CallbackQuery) -> None:
+@router.callback_query(F.data.in_({"topup", "deals:mine", "top:sellers", "refs"}))
+async def placeholders(callback: CallbackQuery) -> None:
     await callback.answer()
-    lang = get_lang(callback.from_user.id)
-    await callback.message.answer("Реферальная система скоро будет доступна." if lang == "ru" else "Referral system will be available soon.", reply_markup=back_keyboard(lang))
+    lang = get_user_lang(callback.from_user.id)
+    if lang == "en":
+        messages = {
+            "topup": f"💳 <b>Your balances:</b>\n{balance_lines(callback.from_user.id)}\n\nTop-ups are made by a manager or administrator.",
+            "deals:mine": "📦 Deal history will appear here soon.",
+            "top:sellers": "🏆 Trader rating will open soon.",
+            "refs": "🔗 Referral system will be available soon.",
+        }
+    else:
+        messages = {
+            "topup": f"💳 <b>Ваши балансы:</b>\n{balance_lines(callback.from_user.id)}\n\nПополнение выполняет менеджер или администратор.",
+            "deals:mine": "📦 История сделок скоро появится в этом разделе.",
+            "top:sellers": "🏆 Рейтинг трейдеров скоро будет открыт.",
+            "refs": "🔗 Реферальная система скоро будет доступна.",
+        }
+    await callback.message.answer(messages[callback.data], parse_mode=ParseMode.HTML)
 
 
-@router.callback_query(F.data.startswith("cancel:"))
-async def cancel_order(callback: CallbackQuery) -> None:
-    await callback.answer("Canceled")
-    lang = get_lang(callback.from_user.id)
-    await callback.message.answer("Ордер отменен." if lang == "ru" else "Order canceled.", reply_markup=back_keyboard(lang))
+@router.callback_query()
+async def unknown_callback(callback: CallbackQuery) -> None:
+    await callback.answer("Кнопка уже неактуальна. Нажмите /start.", show_alert=False)
+
+
+@router.message(F.text.startswith(("https://t.me/", "http://t.me/", "@")))
+async def stale_deal_step(message: Message) -> None:
+    await message.answer("Эта форма сделки уже неактуальна после перезапуска бота.\n\nНажмите /start и создайте сделку заново.")
+
+
+async def send_admin_help(message: Message) -> None:
+    await message.answer(
+        "<b>Админ-панель</b>\n\n"
+        "/addbalance &lt;telegram_id&gt; &lt;amount&gt; [Stars|TON|USDT|RUB]\n"
+        "/balance &lt;telegram_id&gt;\n"
+        "/setpaylink &lt;url&gt;",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def add_balance_from_parts(message: Message, parts: list[str]) -> None:
+    if len(parts) < 2:
+        await message.answer("Формат: /addbalance <telegram_id> <amount> [Stars|TON|USDT|RUB]")
+        return
+    try:
+        user_id = int(parts[0])
+        value = float(parts[1].replace(",", "."))
+    except ValueError:
+        await message.answer("ID и сумма должны быть числами.")
+        return
+    currency = parts[2] if len(parts) > 2 else "Stars"
+    if currency not in CURRENCIES:
+        await message.answer("Валюта должна быть одной из: Stars, TON, USDT, RUB")
+        return
+    add_balance(user_id, value, currency)
+    admin = message.from_user
+    logger.info(
+        "balance_added admin_id=%s admin_username=%s target_user_id=%s amount=%s currency=%s",
+        admin.id if admin else None,
+        admin.username if admin else None,
+        user_id,
+        value,
+        currency,
+    )
+    await message.answer(f"✅ Баланс пользователя <code>{user_id}</code> пополнен на {money(value)} {currency}.", parse_mode=ParseMode.HTML)
+
+
+async def show_balance_from_parts(message: Message, parts: list[str]) -> None:
+    if len(parts) != 1:
+        await message.answer("Формат: /balance <telegram_id>")
+        return
+    try:
+        user_id = int(parts[0])
+    except ValueError:
+        await message.answer("Формат: /balance <telegram_id>")
+        return
+    await message.answer(f"Балансы <code>{user_id}</code>:\n{balance_lines(user_id)}", parse_mode=ParseMode.HTML)
+
+
+async def set_paylink_from_parts(message: Message, parts: list[str]) -> None:
+    url = " ".join(parts).strip()
+    if not url.startswith(("https://", "http://")):
+        await message.answer("Формат: /setpaylink https://...")
+        return
+    set_setting("payment_url", url)
+    await message.answer(f"✅ Ссылка оплаты обновлена:\n<code>{url}</code>", parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("admin"))
@@ -829,7 +892,25 @@ async def admin(message: Message) -> None:
     if not message.from_user or not is_admin(message.from_user.id):
         await message.answer("Нет доступа.")
         return
-    await message.answer("/addbalance <telegram_id> <amount> [Stars|TON|USDT|RUB]\n/balance <telegram_id>")
+    await send_admin_help(message)
+
+
+@router.message(Command("emoji_id"))
+async def emoji_id_help(message: Message) -> None:
+    await message.answer("Отправь следующим сообщением premium/custom emoji, которые хочешь использовать.\n\nЯ покажу их custom_emoji_id.")
+
+
+@router.message(F.entities)
+async def show_custom_emoji_ids(message: Message) -> None:
+    entities = message.entities or []
+    custom = [entity for entity in entities if entity.type == "custom_emoji"]
+    if not custom:
+        return
+    lines = ["Найденные premium emoji:"]
+    for index, entity in enumerate(custom, 1):
+        emoji_text = (message.text or "")[entity.offset : entity.offset + entity.length]
+        lines.append(f"{index}. {emoji_text} — <code>{entity.custom_emoji_id}</code>")
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("addbalance"))
@@ -837,16 +918,7 @@ async def admin_add_balance(message: Message, command: CommandObject) -> None:
     if not message.from_user or not is_admin(message.from_user.id):
         await message.answer("Нет доступа.")
         return
-    parts = (command.args or "").split()
-    if len(parts) < 2:
-        await message.answer("Формат: /addbalance <telegram_id> <amount> [Stars|TON|USDT|RUB]")
-        return
-    user_id = int(parts[0])
-    amount = float(parts[1].replace(",", "."))
-    currency = parts[2] if len(parts) > 2 else "Stars"
-    add_balance(user_id, amount, currency)
-    logger.info("balance_added admin_id=%s target=%s amount=%s currency=%s", message.from_user.id, user_id, amount, currency)
-    await message.answer(f"✅ Баланс <code>{user_id}</code> пополнен на {money(amount)} {currency}.", parse_mode=ParseMode.HTML)
+    await add_balance_from_parts(message, (command.args or "").split())
 
 
 @router.message(Command("balance"))
@@ -854,26 +926,30 @@ async def admin_balance(message: Message, command: CommandObject) -> None:
     if not message.from_user or not is_admin(message.from_user.id):
         await message.answer("Нет доступа.")
         return
-    try:
-        user_id = int(command.args or "")
-    except ValueError:
-        await message.answer("Формат: /balance <telegram_id>")
+    await show_balance_from_parts(message, (command.args or "").split())
+
+
+@router.message(Command("setpaylink"))
+async def admin_set_paylink(message: Message, command: CommandObject) -> None:
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
         return
-    await message.answer(f"Балансы <code>{user_id}</code>:\n{balance_lines(user_id)}", parse_mode=ParseMode.HTML)
+    await set_paylink_from_parts(message, (command.args or "").split())
 
 
 async def main() -> None:
     global BOT_USERNAME
+
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is empty. Add it to .env or Railway Variables.")
+        raise RuntimeError("BOT_TOKEN is empty. Create .env from .env.example.")
     init_db()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     if not BOT_USERNAME:
         me = await bot.get_me()
         BOT_USERNAME = me.username or ""
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
-    await dp.start_polling(bot)
+    dispatcher = Dispatcher(storage=MemoryStorage())
+    dispatcher.include_router(router)
+    await dispatcher.start_polling(bot)
 
 
 if __name__ == "__main__":
