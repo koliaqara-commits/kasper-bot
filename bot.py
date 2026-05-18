@@ -1044,7 +1044,7 @@ async def emoji_id_help(message: Message) -> None:
     await message.answer("Отправь следующим сообщением premium/custom emoji, которые хочешь использовать.\n\nЯ покажу их custom_emoji_id.")
 
 
-@router.message(F.entities)
+@router.message(F.entities.func(lambda entities: any(entity.type == "custom_emoji" for entity in entities)))
 async def show_custom_emoji_ids(message: Message) -> None:
     entities = message.entities or []
     custom = [entity for entity in entities if entity.type == "custom_emoji"]
